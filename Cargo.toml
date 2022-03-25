@@ -1,0 +1,17 @@
+[package]
+name = "tracing-causality"
+version = "0.1.0"
+edition = "2021"
+license = "MIT/Apache-2.0"
+description = "A tracing layer that tracks the causal relationships between spans, and can be concurrently queried elsewhere."
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+dashmap = "5.2.0"
+indexmap = "1.8.0"
+tracing-core = "0.1.23"
+tracing-subscriber = { version = "0.3.9", features = ["std", "registry"] }
+
+[dev-dependencies]
+tracing = "0.1.32"
