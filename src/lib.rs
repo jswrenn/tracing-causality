@@ -1,11 +1,72 @@
-use dashmap::{DashMap, DashSet};
-use indexmap::{IndexMap, IndexSet};
+use std::fmt;
 use std::iter::ExactSizeIterator;
 use std::sync::{Arc, RwLock, RwLockWriteGuard};
 use tracing_core::span::{Attributes, Id};
 use tracing_core::subscriber::Subscriber;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::registry::LookupSpan;
+
+#[derive(Clone, Debug, Default)]
+struct Hasher;
+
+impl std::hash::BuildHasher for Hasher {
+    type Hasher = rustc_hash::FxHasher;
+
+    fn build_hasher(&self) -> Self::Hasher {
+        rustc_hash::FxHasher::default()
+    }
+}
+
+type DashMap<K, V> = dashmap::DashMap<K, V, Hasher>;
+type DashSet<V> = dashmap::DashSet<V, Hasher>;
+type IndexMap<K, V> = indexmap::IndexMap<K, V, Hasher>;
+type IndexSet<V> = indexmap::IndexSet<V, Hasher>;
+
+/// Produces both a causality-tracing layer, and a queryable causality graph.
+///
+/// This is a shorthand for:
+/// ```rust
+/// let causality_layer = tracing_causality::Layer::new();
+/// let causality_graph = causality_layer.traces();
+/// ```
+pub fn new() -> (Layer, Traces) {
+    let causality_layer = Layer::new();
+    let causality_graph = causality_layer.traces();
+    (causality_layer, causality_graph)
+}
+
+/// The consequences of some [`Id`].
+///
+/// The direct [`Consequences`] of an [`Id`] are produced by [`Trace::direct`].
+/// The indirect [`Consequences`] of an [`Id`] are produced by
+/// [`Trace::indirect`].
+#[derive(Debug, Clone)]
+pub struct Consequences<'trace> {
+    consequences: &'trace IndexSet<Id>,
+}
+
+impl<'trace> Consequences<'trace> {
+    pub const EMPTY: Consequences<'static> = Consequences {
+        consequences: &IndexSet::with_hasher(Hasher),
+    };
+
+    /// The number of consequences.
+    pub fn count(&self) -> usize {
+        self.consequences.len()
+    }
+
+    /// Produces `true` if `id` is one of the consequences.
+    pub fn has<'s>(&self, id: impl Into<Option<&'s Id>>) -> bool {
+        id.into()
+            .map(|id| self.consequences.contains(id))
+            .unwrap_or(false)
+    }
+
+    /// Produces an iterator over the consequences.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = &Id> {
+        self.consequences.iter()
+    }
+}
 
 /// The immediate consequences of a span.
 #[derive(Default, Debug, Clone)]
@@ -31,39 +92,9 @@ type LockedCausalTrees<'a> = RwLockWriteGuard<'a, ConcurrentCausalTrees>;
 #[derive(Debug, Clone)]
 pub struct Trace {
     /// The root [`Id`] of this [`Trace`]'s tree.
-    pub root: Id,
+    root: Id,
     /// The causality trace, rooted at `Trace::root`.
     tree: IndexMap<Id, Causality<IndexSet<Id>, ()>>,
-}
-
-impl Trace {
-    /// If the given `id` is part of this [`Trace`], produces an iterator over
-    /// the [`Id`]s of spans with a direct (parent–child) causal relationship to
-    /// the span with the given `id`.
-    ///
-    /// The [`Id`]s produced by this iterator are guaranteed to appear in
-    /// [`Trace`].
-    ///
-    /// Produces `None` if `id` is not a part of this [`Trace`].
-    pub fn direct(&self, id: &Id) -> Option<impl ExactSizeIterator<Item = &Id>> {
-        self.tree
-            .get(id)
-            .map(|consequences| consequences.direct.iter())
-    }
-
-    /// If the given `id` is part of this [`Trace`], produces an iterator over
-    /// the [`Id`]s of spans with a indirect (follows_from) causal relationship
-    /// to the given `id`.
-    ///
-    /// The [`Id`]s produced by this iterator are **not** guaranteed to appear
-    /// in [`Trace`].
-    ///
-    /// Produces `None` if `id` is not a part of this [`Trace`].
-    pub fn indirect(&self, id: &Id) -> Option<impl ExactSizeIterator<Item = &Id>> {
-        self.tree
-            .get(id)
-            .map(|consequences| consequences.indirect.iter())
-    }
 }
 
 impl Trace {
@@ -91,11 +122,31 @@ impl Trace {
 
                 // copy the indirect consequences
                 for indirect_consequence in consequences.indirect.iter() {
-                    trace_vertex.direct.insert(indirect_consequence.clone());
+                    trace_vertex.indirect.insert(indirect_consequence.clone());
                 }
             }
         }
         trace
+    }
+
+    /// Produces the direct [`Consequences`] of a given [`Id`].
+    pub fn direct<'s>(&self, id: impl Into<Option<&'s Id>>) -> Consequences<'_> {
+        id.into()
+            .and_then(|id| self.tree.get(id))
+            .map(|consequences| Consequences {
+                consequences: &consequences.direct,
+            })
+            .unwrap_or(Consequences::EMPTY)
+    }
+
+    /// Produces the indirect [`Consequences`] of a given [`Id`].
+    pub fn indirect<'s>(&self, id: impl Into<Option<&'s Id>>) -> Consequences<'_> {
+        id.into()
+            .and_then(|id| self.tree.get(id))
+            .map(|consequences| Consequences {
+                consequences: &consequences.indirect,
+            })
+            .unwrap_or(Consequences::EMPTY)
     }
 }
 
@@ -109,10 +160,10 @@ pub struct Traces {
 ///
 /// Acquire this lock by calling [`Traces::lock`].
 ///
-/// While this lock is held, the causality graph shared by [`Traces`]
-/// and [`Layer`] is read-only. This ensures that the [`Trace`]s
-/// produced by [`Lock::consequences`] are consistent with
-/// respect to the instant that method is invoked.
+/// While this lock is held, the causality graph shared by [`Traces`] and
+/// [`Layer`] is read-only. This ensures that the [`Trace`]s produced by
+/// [`Lock::trace`] are consistent with respect to the instant that method is
+/// invoked.
 ///
 /// This lock should only ever be held very briefly, as holding it will cause
 /// [`Layer`] to block.
@@ -125,10 +176,10 @@ impl<'tracing_causality> Lock<'tracing_causality> {
     ///
     /// The produced [`Trace`] will be consistent with respect to the instant
     /// this method is invoked.
-    pub fn consequences(&self, id: Id) -> Trace {
+    pub fn trace<'s>(&self, id: &'s Id) -> Trace {
         Trace::of(&self.trees, id.clone())
     }
-    
+
     /// Release this [`Lock`]. Dropping this [`Lock`] has the same effect.
     pub fn release(self) {
         let _ = self;
@@ -136,29 +187,12 @@ impl<'tracing_causality> Lock<'tracing_causality> {
 }
 
 impl Traces {
-    /// Constructs a [`Traces`].
-    pub fn new() -> Self {
-        Self {
-            trees: Arc::new(LockableCausalTrees::default()),
-        }
-    }
-
-    /// Produces a [tracing-subscriber `Layer`][tracing-layer] concurrently
-    /// updates this [`Traces`] with the causal relationship between spans.
-    ///
-    /// [tracing-layer]: tracing_subscriber::layer::Layer
-    pub fn layer(&self) -> Layer {
-        Layer {
-            trees: self.trees.clone(),
-        }
-    }
-
     /// Secure an exclusive lock on [`Traces`].
     ///
-    /// While this lock is held, the causality graph shared by
-    /// [`Traces`] and [`Layer`] is read-only. This ensures
-    /// that the [`Trace`]s produced by [`Lock::consequences`]
-    /// are consistent with respect to the instant that method is invoked.
+    /// While this lock is held, the causality graph shared by [`Traces`] and
+    /// [`Layer`] is read-only. This ensures that the [`Trace`]s produced by
+    /// [`Lock::trace`] are consistent with respect to the instant that method
+    /// is invoked.
     ///
     /// This lock should only ever be held very briefly, as holding it will
     /// cause [`Layer`] to block.
@@ -175,8 +209,8 @@ impl Traces {
     /// traversing it to produce a trace.
     ///
     /// To instead produce a [`Trace`] over a frozen causality graph, first
-    /// invoke [`Traces::lock`], then call [`Lock::consequences`].
-    pub fn consequences(&self, id: Id) -> Trace {
+    /// invoke [`Traces::lock`], then call [`Lock::trace`].
+    pub fn trace<'s>(&self, id: &'s Id) -> Trace {
         let graph = self.trees.read().unwrap_or_else(|e| unreachable!({ e }));
         Trace::of(&graph, id.clone())
     }
@@ -186,24 +220,44 @@ impl Traces {
 /// [`Traces`].
 ///
 /// Acquire the [`Layer`] corresponding to a [`Trace`] by calling
-/// [`Traces::layer`].
+/// [`Layer::traces`].
 ///
 /// [tracing-layer]: tracing_subscriber::layer::Layer
 pub struct Layer {
     trees: Arc<LockableCausalTrees>,
 }
 
+impl Layer {
+    /// Produces a [tracing-subscriber `Layer`][tracing-layer] concurrently
+    /// updates [`Traces`] with the causal relationship between spans.
+    ///
+    /// [tracing-layer]: tracing_subscriber::layer::Layer
+    pub fn new() -> Self {
+        Self {
+            trees: Arc::new(LockableCausalTrees::default()),
+        }
+    }
+
+    /// A concurrently-updated causality graph of the traces analyzed by this
+    /// [`Layer`].
+    pub fn traces(&self) -> Traces {
+        Traces {
+            trees: self.trees.clone(),
+        }
+    }
+}
+
 impl<S> tracing_subscriber::layer::Layer<S> for Layer
 where
     S: Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
 {
-    fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, _ctx: Context<'_, S>) {
+    fn on_new_span(&self, _: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
         let trees = self.trees.read().unwrap_or_else(|e| unreachable!({ e }));
         // add the span id as a vertex in the causality graph
         trees.insert(id.clone(), Default::default());
         // if the span has a parent, add an edge between the parent and the span
-        if let Some(parent) = attrs.parent() {
-            if let Some(consequences) = trees.get(parent) {
+        if let Some(parent) = ctx.lookup_current().map(|parent| parent.id()) {
+            if let Some(consequences) = trees.get(&parent) {
                 consequences.direct.insert(id.clone());
             } else {
                 panic!("parent {:?} closed before child {:?}", parent, id);
@@ -225,8 +279,8 @@ where
             // > If this span is disabled, or the resulting follows-from
             // > relationship would be invalid, this function will do nothing.
             unreachable!(
-                "consequent {:?} closed before cause {:?}",
-                consequent, cause
+                "cause {:?} closed before consequent {:?}",
+                cause, consequent
             );
         };
         // record that `consequent`'s indirect causes includes `cause`
@@ -290,5 +344,49 @@ where
             // span with this `id` has already been closed.
             panic!("span {:?} does not exist in causality graph", id);
         }
+    }
+}
+
+fn display(
+    f: &mut fmt::Formatter,
+    root: &Id,
+    is_last: bool,
+    tree: &IndexMap<Id, Causality<IndexSet<Id>, ()>>,
+    prefix: &mut String,
+) -> fmt::Result {
+    let direct = &tree.get(root).unwrap().direct;
+    let indirect = &tree.get(root).unwrap().indirect;
+    let root = root.into_u64();
+
+    let root_prefix = format!("{}{}─", prefix, if is_last { '└' } else { '├' });
+    let mut root_prefix = root_prefix.chars();
+    let _ = (root_prefix.next(), root_prefix.next());
+    let root_prefix = root_prefix.as_str();
+
+    if indirect.len() > 0 {
+        write!(f, "{}{} ⤑ ", root_prefix, root)?;
+        f.debug_set()
+            .entries(indirect.iter().map(|id| id.into_u64()))
+            .finish()?;
+        writeln!(f)?;
+    } else {
+        writeln!(f, "{}{:?}", root_prefix, root)?;
+    }
+
+    prefix.push_str(if is_last { "│ " } else { "  " });
+
+    for (i, consequence) in direct.iter().enumerate() {
+        let is_last = i == direct.len() - 1;
+        display(f, consequence, is_last, tree, prefix)?;
+    }
+
+    let _ = (prefix.pop(), prefix.pop());
+
+    Ok(())
+}
+
+impl fmt::Display for Trace {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        display(f, &self.root, true, &self.tree, &mut String::new())
     }
 }

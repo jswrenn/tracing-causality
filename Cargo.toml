@@ -10,6 +10,7 @@ description = "A tracing layer that tracks the causal relationships between span
 [dependencies]
 dashmap = "5.2.0"
 indexmap = "1.8.0"
+rustc-hash = "1.1.0"
 tracing-core = "0.1.23"
 tracing-subscriber = { version = "0.3.9", features = ["std", "registry"] }
 
