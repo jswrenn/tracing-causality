@@ -84,6 +84,12 @@ impl Updates {
             .into_stream()
             .take_while(move |_| std::future::ready(!self.overflow_flag.check()))
     }
+
+    /// Produces an iterator over all [`Update`]s currently sitting in the
+    /// the channel.
+    pub fn drain(&self) -> impl Iterator<Item = Update> + '_ {
+        self.receiver.drain()
+    }
 }
 
 #[derive(Clone)]
