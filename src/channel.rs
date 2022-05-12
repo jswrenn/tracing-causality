@@ -1,14 +1,19 @@
 use crate::Update;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
+use std::{
+    collections::BTreeSet,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
+use tracing_core::span::Id;
 
 /// Constructs a channel of [`Trace`] updates bounded at `capacity`.
-pub(crate) fn bounded(capacity: usize) -> (Sender, Updates) {
+pub(crate) fn bounded(id: Id, capacity: usize) -> (Sender, Updates) {
     let (sender, receiver) = flume::bounded(capacity);
     let overflow_flag = OverflowFlag::default();
     let sender = Sender {
+        id,
         sender,
         overflow_flag: overflow_flag.clone(),
     };
@@ -59,6 +64,14 @@ pub struct Updates {
 }
 
 impl Updates {
+    pub fn is_empty(&self) -> bool {
+        self.receiver.is_empty()
+    }
+
+    pub(crate) fn next(&self) -> Option<Update> {
+        self.receiver.try_recv().ok()
+    }
+
     pub fn into_iter(self) -> impl Iterator<Item = Update> {
         self.receiver
             .into_iter()
@@ -67,13 +80,15 @@ impl Updates {
 
     pub fn into_stream(self) -> impl futures_core::stream::Stream {
         use futures::stream::StreamExt;
-        self.receiver.into_stream()
-          .take_while(move |_| std::future::ready(!self.overflow_flag.check()))
+        self.receiver
+            .into_stream()
+            .take_while(move |_| std::future::ready(!self.overflow_flag.check()))
     }
 }
 
 #[derive(Clone)]
 pub(crate) struct Sender {
+    id: Id,
     sender: flume::Sender<Update>,
     overflow_flag: OverflowFlag,
 }
@@ -96,8 +111,34 @@ impl Sender {
             .map(|_| {})
     }
 
-    pub(crate) fn broadcast(listeners: &mut Vec<Self>, update: Update) {
+    pub(crate) fn broadcast(listeners: &mut BTreeSet<Self>, update: Update) {
         listeners.retain(|listener| listener.try_send(update.clone()).is_ok());
+    }
+}
+
+impl std::hash::Hash for Sender {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
+
+impl Eq for Sender {}
+
+impl Ord for Sender {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.id.into_u64().cmp(&other.id.into_u64())
+    }
+}
+
+impl PartialOrd for Sender {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        self.id.into_u64().partial_cmp(&other.id.into_u64())
+    }
+}
+
+impl PartialEq for Sender {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
     }
 }
 
@@ -108,19 +149,21 @@ mod test_sender {
 
     #[test]
     fn try_send_success() {
-        let (sender, updates) = bounded(1);
+        let (sender, updates) = bounded(Id::from_u64(1), 1);
         let update = Update::Direct {
             cause: Id::from_u64(1),
             consequence: Id::from_u64(2),
         };
-        let send_result = sender.try_send(update);
+        let send_result = sender.try_send(update.clone());
         assert!(send_result.is_ok());
+        assert_eq!(updates.next(), Some(update.clone()));
+        assert!(updates.is_empty());
     }
 
     #[test]
     fn try_send_err_disconnected() {
         // drop `Updates` immediately
-        let (sender, _) = bounded(1);
+        let (sender, _) = bounded(Id::from_u64(1), 1);
         let update = Update::Direct {
             cause: Id::from_u64(1),
             consequence: Id::from_u64(2),
@@ -132,7 +175,7 @@ mod test_sender {
     #[test]
     fn try_send_err_full() {
         // set capacity to 0 to overflow on first send
-        let (sender, updates) = bounded(0);
+        let (sender, updates) = bounded(Id::from_u64(1), 0);
         let update = Update::Direct {
             cause: Id::from_u64(1),
             consequence: Id::from_u64(2),
@@ -141,5 +184,6 @@ mod test_sender {
         let send_result = sender.try_send(update);
         assert!(send_result.is_err());
         assert_eq!(updates.overflow_flag.check(), true);
+        assert_eq!(updates.next(), None,);
     }
 }
