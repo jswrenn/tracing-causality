@@ -98,10 +98,10 @@ where
 /// ```
 pub struct Causality<S>
 where
-    S: for<'span> LookupSpan<'span> + Send + Sync,
+    S: for<'span> LookupSpan<'span>,
 {
     subscriber:
-        Arc<dyn for<'span> LookupSpan<'span, Data = <S as LookupSpan<'span>>::Data> + Send + Sync>,
+        Arc<dyn for<'span> LookupSpan<'span, Data = <S as LookupSpan<'span>>::Data>>,
     _type: PhantomData<S>,
 }
 
@@ -119,9 +119,9 @@ where
 /// ```
 pub fn for_subscriber<S>(
     subscriber: S,
-) -> (Arc<dyn Subscriber + Send + Sync + 'static>, Causality<S>)
+) -> (Arc<dyn Subscriber + 'static>, Causality<S>)
 where
-    S: Subscriber + for<'span> LookupSpan<'span> + Send + Sync + 'static,
+    S: Subscriber + for<'span> LookupSpan<'span>  + 'static,
 {
     let subscriber: Arc<S> = Arc::new(subscriber);
     let causality = Causality::from_subscriber(subscriber.clone());
@@ -130,7 +130,7 @@ where
 
 impl<S> Causality<S>
 where
-    S: for<'span> LookupSpan<'span> + Send + Sync + 'static,
+    S: for<'span> LookupSpan<'span> + 'static,
 {
     fn from_subscriber(subscriber: Arc<S>) -> Causality<S> {
         Causality {
@@ -141,7 +141,7 @@ where
 
     pub fn into_subscriber(
         &self,
-    ) -> Arc<dyn for<'span> LookupSpan<'span, Data = <S as LookupSpan<'span>>::Data> + Send + Sync>
+    ) -> Arc<dyn for<'span> LookupSpan<'span, Data = <S as LookupSpan<'span>>::Data>>
     {
         self.subscriber.clone()
     }
@@ -215,7 +215,7 @@ impl Layer {
     /// Record that a span `follows_from` itself.
     pub(crate) fn on_follows_self<S>(&self, span_id: &Id, ctx: Context<'_, S>)
     where
-        S: Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
+        S: Subscriber + for<'span> LookupSpan<'span>,
     {
         use data::IndirectCauses;
         let span = ctx.span(span_id).expect("Span not found, this is a bug");
@@ -250,7 +250,7 @@ impl Layer {
 
 impl<S> tracing_subscriber::layer::Layer<S> for Layer
 where
-    S: Subscriber + for<'span> LookupSpan<'span> + Send + Sync,
+    S: Subscriber + for<'span> LookupSpan<'span>,
 {
     fn on_new_span(&self, _: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
         let span = ctx.span(id).expect("Span not found, this is a bug");
@@ -378,7 +378,7 @@ mod test_util {
 
     impl<S> Causality<S>
     where
-        S: for<'span> LookupSpan<'span> + Send + Sync + 'static,
+        S: for<'span> LookupSpan<'span> + 'static,
     {
         pub(crate) fn updates_for(&self, span: &Span) -> channel::Updates {
             use crate::data::Listeners;
