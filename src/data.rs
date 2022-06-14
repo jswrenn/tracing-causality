@@ -4,7 +4,7 @@ use std::collections::{BTreeSet, HashSet};
 use tracing_core::span::Id;
 
 /// The consequences — direct and indirect — of a `Span`.
-#[derive(Clone, Eq, PartialEq, Debug)]
+#[derive(Clone, Eq, PartialEq, Debug, Default)]
 pub struct Consequences {
     pub(crate) direct: HashSet<Id>,
     pub(crate) indirect: HashSet<Id>,
@@ -12,23 +12,23 @@ pub struct Consequences {
 
 impl Consequences {
     /// Constructs a new, empty `Consequences`.
-    pub(crate) fn new() -> Self {
+    pub fn none() -> Self {
         Self {
             direct: HashSet::default(),
             indirect: HashSet::default(),
         }
     }
 
-    /// Constructs an instance of `Consequences` with the given direct consequence.
-    pub(crate) fn with_direct(direct: Id) -> Self {
-        let mut consequences = Self::new();
+    /// Constructs a `Consequences` with the given direct consequence.
+    pub fn with_direct(direct: Id) -> Self {
+        let mut consequences = Self::none();
         consequences.direct.insert(direct);
         consequences
     }
 
-    /// Constructs an instance of `Consequences` with the given indirect consequence.
-    pub(crate) fn with_indirect(indirect: Id) -> Self {
-        let mut consequences = Self::new();
+    /// Constructs a `Consequences` with the given indirect consequence.
+    pub fn with_indirect(indirect: Id) -> Self {
+        let mut consequences = Self::none();
         consequences.indirect.insert(indirect);
         consequences
     }
@@ -48,7 +48,7 @@ impl Consequences {
         self.direct.remove(direct);
     }
 
-    /// Remove the given idirect consequence.
+    /// Remove the given indirect consequence.
     pub(crate) fn remove_indirect(&mut self, indirect: &Id) {
         self.indirect.remove(indirect);
     }
@@ -56,14 +56,16 @@ impl Consequences {
     /// Returns `true` if the given `id` is among this span's direct consequences.
     ///
     /// ```
-    /// use tracing::trace_span;
-    /// use tracing_causality::{self, Consequences};
-    /// use tracing_subscriber::{prelude::*, registry::{Registry, SpanData}};
+    /// use std::sync::Arc;
+    /// use tracing::{Subscriber, trace_span};
+    /// use tracing_causality::{self as causality, Consequences};
+    /// use tracing_subscriber::{prelude::*, registry::{LookupSpan, SpanData, Registry}};
     ///
-    /// let subscriber = Registry::default().with(tracing_causality::Layer);
-    /// let (subscriber, causality) = tracing_causality::for_subscriber(subscriber);
-    /// let registry = causality.into_subscriber();
-    /// subscriber.init();
+    /// let subscriber: Arc<dyn Subscriber + Send + Sync > =
+    ///     Arc::new(Registry::default().with(causality::Layer));
+    /// subscriber.clone().init();
+    /// let subscriber: Arc<dyn Subscriber> = subscriber;
+    /// let registry = subscriber.downcast_ref::<Registry>().unwrap();
     ///
     /// let root = trace_span!("root");
     /// let root_id = root.id().unwrap();
@@ -82,14 +84,16 @@ impl Consequences {
     /// Returns `true` if the given `id` is among this span's indirect consequences.
     ///
     /// ```
-    /// use tracing::trace_span;
-    /// use tracing_causality::{self, Consequences};
-    /// use tracing_subscriber::{prelude::*, registry::{Registry, SpanData}};
+    /// use std::sync::Arc;
+    /// use tracing::{Subscriber, trace_span};
+    /// use tracing_causality::{self as causality, Consequences};
+    /// use tracing_subscriber::{prelude::*, registry::{LookupSpan, SpanData, Registry}};
     ///
-    /// let subscriber = Registry::default().with(tracing_causality::Layer);
-    /// let (subscriber, causality) = tracing_causality::for_subscriber(subscriber);
-    /// let registry = causality.into_subscriber();
-    /// subscriber.init();
+    /// let subscriber: Arc<dyn Subscriber + Send + Sync > =
+    ///     Arc::new(Registry::default().with(causality::Layer));
+    /// subscriber.clone().init();
+    /// let subscriber: Arc<dyn Subscriber> = subscriber;
+    /// let registry = subscriber.downcast_ref::<Registry>().unwrap();
     ///
     /// let root = trace_span!("root");
     /// let root_id = root.id().unwrap();
@@ -109,14 +113,16 @@ impl Consequences {
     /// An iterator visiting all direct consequences in arbitrary order.
     ///
     /// ```
-    /// use tracing::trace_span;
-    /// use tracing_causality::{self, Consequences};
-    /// use tracing_subscriber::{prelude::*, registry::{Registry, SpanData}};
+    /// use std::sync::Arc;
+    /// use tracing::{Subscriber, trace_span};
+    /// use tracing_causality::{self as causality, Consequences};
+    /// use tracing_subscriber::{prelude::*, registry::{LookupSpan, SpanData, Registry}};
     ///
-    /// let subscriber = Registry::default().with(tracing_causality::Layer);
-    /// let (subscriber, causality) = tracing_causality::for_subscriber(subscriber);
-    /// let registry = causality.into_subscriber();
-    /// subscriber.init();
+    /// let subscriber: Arc<dyn Subscriber + Send + Sync > =
+    ///     Arc::new(Registry::default().with(causality::Layer));
+    /// subscriber.clone().init();
+    /// let subscriber: Arc<dyn Subscriber> = subscriber;
+    /// let registry = subscriber.downcast_ref::<Registry>().unwrap();
     ///
     /// let root = trace_span!("root");
     /// let root_id = root.id().unwrap();
@@ -128,24 +134,26 @@ impl Consequences {
     /// let root_consequences = root_extensions.get::<Consequences>().unwrap();
     /// assert_eq!(
     ///     root_consequences.iter_direct().next(),
-    ///     Some(&consequence_id)
+    ///     Some(consequence_id)
     /// );
     /// ```
-    pub fn iter_direct(&self) -> impl Iterator<Item = &Id> {
-        self.direct.iter()
+    pub fn iter_direct(&self) -> impl Iterator<Item = Id> + '_ {
+        self.direct.iter().cloned()
     }
 
     /// An iterator visiting all direct consequences in arbitrary order.
     ///
     /// ```
-    /// use tracing::trace_span;
-    /// use tracing_causality::{self, Consequences};
-    /// use tracing_subscriber::{prelude::*, registry::{Registry, SpanData}};
+    /// use std::sync::Arc;
+    /// use tracing::{Subscriber, trace_span};
+    /// use tracing_causality::{self as causality, Consequences};
+    /// use tracing_subscriber::{prelude::*, registry::{LookupSpan, SpanData, Registry}};
     ///
-    /// let subscriber = Registry::default().with(tracing_causality::Layer);
-    /// let (subscriber, causality) = tracing_causality::for_subscriber(subscriber);
-    /// let registry = causality.into_subscriber();
-    /// subscriber.init();
+    /// let subscriber: Arc<dyn Subscriber + Send + Sync > =
+    ///     Arc::new(Registry::default().with(causality::Layer));
+    /// subscriber.clone().init();
+    /// let subscriber: Arc<dyn Subscriber> = subscriber;
+    /// let registry = subscriber.downcast_ref::<Registry>().unwrap();
     ///
     /// let root = trace_span!("root");
     /// let root_id = root.id().unwrap();
@@ -158,11 +166,11 @@ impl Consequences {
     /// let root_consequences = root_extensions.get::<Consequences>().unwrap();
     /// assert_eq!(
     ///     root_consequences.iter_indirect().next(),
-    ///     Some(&consequence_id)
+    ///     Some(consequence_id)
     /// );
     /// ```
-    pub fn iter_indirect(&self) -> impl Iterator<Item = &Id> {
-        self.indirect.iter()
+    pub fn iter_indirect(&self) -> impl Iterator<Item = Id> + '_ {
+        self.indirect.iter().cloned()
     }
 }
 
@@ -191,14 +199,16 @@ impl IndirectCauses {
     /// Returns `true` if the given `id` is among this span's indirect causes.
     ///
     /// ```
-    /// use tracing::trace_span;
-    /// use tracing_causality::{self, data::IndirectCauses};
-    /// use tracing_subscriber::{prelude::*, registry::{Registry, SpanData}};
+    /// use std::sync::Arc;
+    /// use tracing::{Subscriber, trace_span};
+    /// use tracing_causality::{self as causality, data::IndirectCauses};
+    /// use tracing_subscriber::{prelude::*, registry::{LookupSpan, SpanData, Registry}};
     ///
-    /// let subscriber = Registry::default().with(tracing_causality::Layer);
-    /// let (subscriber, causality) = tracing_causality::for_subscriber(subscriber);
-    /// let registry = causality.into_subscriber();
-    /// subscriber.init();
+    /// let subscriber: Arc<dyn Subscriber + Send + Sync > =
+    ///     Arc::new(Registry::default().with(causality::Layer));
+    /// subscriber.clone().init();
+    /// let subscriber: Arc<dyn Subscriber> = subscriber;
+    /// let registry = subscriber.downcast_ref::<Registry>().unwrap();
     ///
     /// let root = trace_span!("root");
     /// let root_id = root.id().unwrap();
@@ -220,14 +230,16 @@ impl IndirectCauses {
     /// Produces an iterator over this span's indirect causes.
     ///
     /// ```
-    /// use tracing::trace_span;
-    /// use tracing_causality::{self, data::IndirectCauses};
-    /// use tracing_subscriber::{prelude::*, registry::{Registry, SpanData}};
+    /// use std::sync::Arc;
+    /// use tracing::{Subscriber, trace_span};
+    /// use tracing_causality::{self as causality, data::IndirectCauses};
+    /// use tracing_subscriber::{prelude::*, registry::{LookupSpan, SpanData, Registry}};
     ///
-    /// let subscriber = Registry::default().with(tracing_causality::Layer);
-    /// let (subscriber, causality) = tracing_causality::for_subscriber(subscriber);
-    /// let registry = causality.into_subscriber();
-    /// subscriber.init();
+    /// let subscriber: Arc<dyn Subscriber + Send + Sync > =
+    ///     Arc::new(Registry::default().with(causality::Layer));
+    /// subscriber.clone().init();
+    /// let subscriber: Arc<dyn Subscriber> = subscriber;
+    /// let registry = subscriber.downcast_ref::<Registry>().unwrap();
     ///
     /// let root = trace_span!("root");
     /// let root_id = root.id().unwrap();

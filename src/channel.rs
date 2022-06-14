@@ -24,7 +24,7 @@ pub(crate) fn bounded(id: Id, capacity: usize) -> (Sender, Updates) {
     (sender, updates)
 }
 
-#[derive(Default, Clone)]
+#[derive(Default, Clone, Debug)]
 struct OverflowFlag {
     flag: Arc<AtomicBool>,
 }
@@ -68,7 +68,14 @@ impl Updates {
         self.receiver.is_empty()
     }
 
-    pub(crate) fn next(&self) -> Option<Update> {
+    /// Returns `true` if the span that these `Updates` are being provided for
+    /// has been closed.
+    ///
+    pub fn is_disconnected(&self) -> bool {
+        self.receiver.is_disconnected()
+    }
+
+    pub fn next(&self) -> Option<Update> {
         self.receiver.try_recv().ok()
     }
 
@@ -87,12 +94,12 @@ impl Updates {
 
     /// Produces an iterator over all [`Update`]s currently sitting in the
     /// the channel.
-    pub fn drain(&self) -> impl Iterator<Item = Update> + '_ {
+    pub fn drain(&self) -> impl ExactSizeIterator<Item = Update> + '_ {
         self.receiver.drain()
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct Sender {
     id: Id,
     sender: flume::Sender<Update>,
@@ -144,7 +151,7 @@ impl PartialOrd for Sender {
 
 impl PartialEq for Sender {
     fn eq(&self, other: &Self) -> bool {
-        self.id == other.id
+        self.id.eq(&other.id)
     }
 }
 
@@ -153,10 +160,36 @@ mod test_sender {
     use super::*;
     use tracing_core::span::Id;
 
+    /// `Updates::is_disconnected` should produce `true` as soon as the last
+    /// sender is dropped, even if there remain updates.
+    #[test]
+    fn should_disconnect_if_sender_dropped() {
+        let (sender, updates) = bounded(Id::from_u64(1), 1);
+
+        assert!(!updates.is_disconnected());
+
+        let update = Update::OpenDirect {
+            cause: Id::from_u64(1),
+            consequence: Id::from_u64(2),
+        };
+
+        sender
+            .try_send(update.clone())
+            .expect("sending should succeed");
+
+        assert!(!updates.is_disconnected());
+
+        drop(sender);
+
+        assert!(updates.is_disconnected());
+
+        assert_eq!(updates.next(), Some(update.clone()));
+    }
+
     #[test]
     fn try_send_success() {
         let (sender, updates) = bounded(Id::from_u64(1), 1);
-        let update = Update::Direct {
+        let update = Update::OpenDirect {
             cause: Id::from_u64(1),
             consequence: Id::from_u64(2),
         };
@@ -170,7 +203,7 @@ mod test_sender {
     fn try_send_err_disconnected() {
         // drop `Updates` immediately
         let (sender, _) = bounded(Id::from_u64(1), 1);
-        let update = Update::Direct {
+        let update = Update::OpenDirect {
             cause: Id::from_u64(1),
             consequence: Id::from_u64(2),
         };
@@ -182,7 +215,7 @@ mod test_sender {
     fn try_send_err_full() {
         // set capacity to 0 to overflow on first send
         let (sender, updates) = bounded(Id::from_u64(1), 0);
-        let update = Update::Direct {
+        let update = Update::OpenDirect {
             cause: Id::from_u64(1),
             consequence: Id::from_u64(2),
         };
