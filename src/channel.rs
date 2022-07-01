@@ -159,18 +159,36 @@ impl PartialEq for Sender {
 mod test_sender {
     use super::*;
     use tracing_core::span::Id;
+    use tracing_subscriber::{prelude::*, registry::Registry};
+
+    use crate as tracing_causality;
 
     /// `Updates::is_disconnected` should produce `true` as soon as the last
     /// sender is dropped, even if there remain updates.
     #[test]
     fn should_disconnect_if_sender_dropped() {
+        let _guard = Registry::default().set_default();
+
         let (sender, updates) = bounded(Id::from_u64(1), 1);
 
         assert!(!updates.is_disconnected());
 
+        let cause = tracing::trace_span!("cause");
+        let consequence = cause.in_scope(|| tracing::trace_span!("consequence"));
+
+        let cause_id_and_metadata = tracing_causality::Span {
+            id: cause.id().unwrap(),
+            metadata: cause.metadata().unwrap(),
+        };
+
+        let consequence_id_and_metadata = tracing_causality::Span {
+            id: consequence.id().unwrap(),
+            metadata: consequence.metadata().unwrap(),
+        };
+
         let update = Update::OpenDirect {
-            cause: Id::from_u64(1),
-            consequence: Id::from_u64(2),
+            cause: cause_id_and_metadata,
+            consequence: consequence_id_and_metadata,
         };
 
         sender
@@ -188,10 +206,26 @@ mod test_sender {
 
     #[test]
     fn try_send_success() {
+        let _guard = Registry::default().set_default();
+
         let (sender, updates) = bounded(Id::from_u64(1), 1);
+
+        let cause = tracing::trace_span!("cause");
+        let consequence = cause.in_scope(|| tracing::trace_span!("consequence"));
+
+        let cause_id_and_metadata = tracing_causality::Span {
+            id: cause.id().unwrap(),
+            metadata: cause.metadata().unwrap(),
+        };
+
+        let consequence_id_and_metadata = tracing_causality::Span {
+            id: consequence.id().unwrap(),
+            metadata: consequence.metadata().unwrap(),
+        };
+
         let update = Update::OpenDirect {
-            cause: Id::from_u64(1),
-            consequence: Id::from_u64(2),
+            cause: cause_id_and_metadata,
+            consequence: consequence_id_and_metadata,
         };
         let send_result = sender.try_send(update.clone());
         assert!(send_result.is_ok());
@@ -201,11 +235,27 @@ mod test_sender {
 
     #[test]
     fn try_send_err_disconnected() {
+        let _guard = Registry::default().set_default();
+
         // drop `Updates` immediately
         let (sender, _) = bounded(Id::from_u64(1), 1);
+
+        let cause = tracing::trace_span!("cause");
+        let consequence = cause.in_scope(|| tracing::trace_span!("consequence"));
+
+        let cause_id_and_metadata = tracing_causality::Span {
+            id: cause.id().unwrap(),
+            metadata: cause.metadata().unwrap(),
+        };
+
+        let consequence_id_and_metadata = tracing_causality::Span {
+            id: consequence.id().unwrap(),
+            metadata: consequence.metadata().unwrap(),
+        };
+
         let update = Update::OpenDirect {
-            cause: Id::from_u64(1),
-            consequence: Id::from_u64(2),
+            cause: cause_id_and_metadata,
+            consequence: consequence_id_and_metadata,
         };
         let send_result = sender.try_send(update);
         assert!(send_result.is_err());
@@ -213,11 +263,26 @@ mod test_sender {
 
     #[test]
     fn try_send_err_full() {
+        let _guard = Registry::default().set_default();
+
         // set capacity to 0 to overflow on first send
         let (sender, updates) = bounded(Id::from_u64(1), 0);
+        let cause = tracing::trace_span!("cause");
+        let consequence = cause.in_scope(|| tracing::trace_span!("consequence"));
+
+        let cause_id_and_metadata = tracing_causality::Span {
+            id: cause.id().unwrap(),
+            metadata: cause.metadata().unwrap(),
+        };
+
+        let consequence_id_and_metadata = tracing_causality::Span {
+            id: consequence.id().unwrap(),
+            metadata: consequence.metadata().unwrap(),
+        };
+
         let update = Update::OpenDirect {
-            cause: Id::from_u64(1),
-            consequence: Id::from_u64(2),
+            cause: cause_id_and_metadata,
+            consequence: consequence_id_and_metadata,
         };
         assert_eq!(updates.overflow_flag.check(), false);
         let send_result = sender.try_send(update);

@@ -1,4 +1,6 @@
+use std::hash::{Hash, Hasher};
 use std::collections::HashMap;
+use tracing_core::Metadata;
 use tracing_core::span::{Attributes, Id};
 use tracing_core::subscriber::Subscriber;
 use tracing_subscriber::layer::Context;
@@ -15,14 +17,37 @@ pub use data::Consequences;
 use data::Listeners;
 
 /// A causality graph, rooted at a given [`Id`].
+#[derive(Debug, Clone)]
 pub struct Trace {
-    root: Id,
-    adj: HashMap<Id, Consequences>,
+    pub root: Span,
+    pub adj: HashMap<Span, Consequences>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Span {
+    pub id: Id,
+    pub metadata: &'static Metadata<'static>,
+}
+
+impl Hash for Span {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+        self.metadata.callsite().hash(state);
+    }
+}
+
+impl Eq for Span {}
+
+impl PartialEq for Span {
+    fn eq(&self, other: &Self) -> bool {
+        &self.id == &other.id 
+            && self.metadata.callsite() == other.metadata.callsite()
+    }
 }
 
 impl Trace {
     /// The `Id` of the root span of this trace.
-    pub fn root(&self) -> Id {
+    pub fn root(&self) -> Span {
         self.root.to_owned()
     }
 
@@ -32,36 +57,41 @@ impl Trace {
     }
 
     /// The consequences of the given `id`.
-    pub fn consequences(&self, id: &Id) -> Option<&Consequences> {
-        self.adj.get(id)
+    pub fn consequences(&self, span: &Span) -> Option<&Consequences> {
+        self.adj.get(span)
     }
 
     /// Update [`Trace`] with the given [`Update`].
-    pub fn apply(&mut self, update: Update) {
+    pub fn apply(mut self, update: Update) -> Option<Trace> {
         match update {
             Update::OpenDirect { cause, consequence } => {
                 self.adj
                     .entry(cause)
                     .or_insert_with(Consequences::none)
                     .add_direct(consequence);
+                Some(self)
             }
             Update::NewIndirect { cause, consequence } => {
                 self.adj
                     .entry(cause)
                     .or_insert_with(Consequences::none)
                     .add_indirect(consequence);
+                Some(self)
             }
-            Update::CloseDirect { id, direct_cause } => {
-                let _ = self.adj.remove(&id);
-
+            Update::CloseDirect { span, direct_cause } => {
                 if let Some(direct_cause) = direct_cause {
+                    let _ = self.adj.remove(&span);
                     if let Some(consequences) = self.adj.get_mut(&direct_cause) {
-                        consequences.remove_direct(&id);
+                        consequences.remove_direct(&span);
                     }
+                    Some(self)
+                } else {
+                    debug_assert_eq!(self.root, span);
+                    None
                 }
             }
             Update::CloseIndirect {
-                id,
+                span: id,
                 indirect_causes,
             } => {
                 let _ = self.adj.remove(&id);
@@ -71,38 +101,51 @@ impl Trace {
                         consequences.remove_direct(&id);
                     }
                 }
+
+                Some(self)
             }
             Update::CloseCyclic {
-                id,
+                span: id,
                 direct_cause,
                 indirect_causes,
             } => {
-                let _ = self.adj.remove(&id);
-
                 if let Some(direct_cause) = direct_cause {
+                    let _ = self.adj.remove(&id);
                     if let Some(consequences) = self.adj.get_mut(&direct_cause) {
                         consequences.remove_direct(&id);
                     }
-                }
-
-                for indirect_cause in indirect_causes {
-                    if let Some(consequences) = self.adj.get_mut(&indirect_cause) {
-                        consequences.remove_direct(&id);
+                    for indirect_cause in indirect_causes {
+                        if let Some(consequences) = self.adj.get_mut(&indirect_cause) {
+                            consequences.remove_direct(&id);
+                        }
                     }
+                    Some(self)
+                } else {
+                    debug_assert_eq!(self.root, id);
+                    None
                 }
             }
         }
     }
 
     /// A breadth-first traversal of [`Trace`].
-    pub fn iter(&self) -> impl Iterator<Item = (Id, &Consequences)> {
+    pub fn iter(&self) -> impl Iterator<Item = (Span, &Consequences)> {
         let mut queue = vec![(self.root.clone())];
         std::iter::from_fn(move || {
-            let id = queue.pop()?;
-            let consequences = self.consequences(&id)?;
+            let span = queue.pop()?;
+            let consequences = self.consequences(&span)?;
             queue.extend(consequences.iter_direct());
-            Some((id, consequences))
+            Some((span, consequences))
         })
+    }
+}
+
+impl Trace {
+    pub fn with_root(root: Span) -> Self {
+        Self {
+            root,
+            adj: Default::default(),
+        }
     }
 }
 
@@ -138,22 +181,31 @@ where
 ///     let subscriber = subscriber.downcast_ref::<Registry>().unwrap();
 ///
 ///     let a = tracing::trace_span!("a");
-///     let a_id = a.id().unwrap();
+///     let a_id_and_metadata = causality::Span {
+///         id: a.id().unwrap(),
+///         metadata: a.metadata().unwrap()
+///     };
 ///
 ///     let b = a.in_scope(|| tracing::trace_span!("b"));
-///     let b_id = b.id().unwrap();
+///     let b_id_and_metadata = causality::Span {
+///         id: b.id().unwrap(),
+///         metadata: b.metadata().unwrap()
+///     };
 ///
-///     let (trace, updates) = causality::trace(subscriber, &a_id, 1).unwrap();
-///     assert!(trace.consequences(&a_id).unwrap().contains_direct(&b_id));
+///     let (trace, updates) = causality::trace(subscriber, &a_id_and_metadata.id, 1).unwrap();
+///     assert!(trace.consequences(&a_id_and_metadata).unwrap().contains_direct(&b_id_and_metadata));
 ///
 ///     let c = b.in_scope(|| tracing::trace_span!("c"));
-///     let c_id = c.id().unwrap();
+///     let c_id_and_metadata = causality::Span {
+///         id: c.id().unwrap(),
+///         metadata: c.metadata().unwrap()
+///     };
 ///     
 ///     assert_eq!(
 ///         updates.next(),
 ///         Some(causality::Update::OpenDirect {
-///             cause: b_id,
-///             consequence: c_id,
+///             cause: b_id_and_metadata,
+///             consequence: c_id_and_metadata,
 ///         })
 ///     );
 /// }
@@ -163,14 +215,18 @@ where
     S: for<'span> LookupSpan<'span> + ?Sized,
 {
     let (sender, updates) = channel::bounded(id.clone(), update_capacity);
+    let root = Span {
+        id: id.clone(),
+        metadata: s.span_data(id)?.metadata(),
+    };
     let mut trace = Trace {
-        root: id.to_owned(),
+        root: root.clone(),
         adj: HashMap::default(),
     };
-    let mut queue = vec![id.to_owned()];
-    while let Some(id) = queue.pop() {
-        if let Some(span) = s.span_data(&id) {
-            let mut extensions = span.extensions_mut();
+    let mut queue = vec![root.to_owned()];
+    while let Some(span) = queue.pop() {
+        if let Some(span_data) = s.span_data(&span.id) {
+            let mut extensions = span_data.extensions_mut();
             // add the update listener
             get_or_init_with::<Listeners, _>(&mut extensions, Listeners::new)
                 .insert(sender.clone());
@@ -179,7 +235,7 @@ where
                 // add any further consequences to the traversal queue
                 queue.extend(direct_consequences.direct.iter().cloned());
                 // and to the trace
-                trace.adj.insert(id, direct_consequences);
+                trace.adj.insert(span, direct_consequences);
             }
         } else {
             // the span has already been closed; do nothing
@@ -205,32 +261,38 @@ where
 ///     let registry = subscriber.downcast_ref::<Registry>().unwrap();
 ///
 ///     let a = tracing::trace_span!("a");
-///     let a_id = a.id().unwrap();
+///     let a_id_and_metadata = causality::Span {
+///         id: a.id().unwrap(),
+///         metadata: a.metadata().unwrap()
+///     };
 ///
 ///     assert_eq!(
-///         causality::consequences(registry, &a_id),
+///         causality::consequences(registry, &a_id_and_metadata.id),
 ///         Some(Consequences::none())
 ///     );
 ///
 ///     let b = a.in_scope(|| tracing::trace_span!("b"));
-///     let b_id = b.id().unwrap();
+///     let b_id_and_metadata = causality::Span {
+///         id: b.id().unwrap(),
+///         metadata: b.metadata().unwrap()
+///     };
 ///
 ///     assert_eq!(
-///         causality::consequences(registry, &a_id),
-///         Some(Consequences::with_direct(b_id))
+///         causality::consequences(registry, &a_id_and_metadata.id),
+///         Some(Consequences::with_direct(b_id_and_metadata))
 ///     );
 ///
 ///     drop(b);
 ///
 ///     assert_eq!(
-///         causality::consequences(registry, &a_id),
+///         causality::consequences(registry, &a_id_and_metadata.id),
 ///         Some(Consequences::none())
 ///     );
 ///
 ///     drop(a);
 ///
 ///     assert_eq!(
-///         causality::consequences(registry, &a_id),
+///         causality::consequences(registry, &a_id_and_metadata.id),
 ///         None
 ///     );
 /// }
@@ -269,25 +331,31 @@ pub enum Update {
     ///     let registry = subscriber.downcast_ref::<Registry>().unwrap();
     ///
     ///     let cause = tracing::trace_span!("cause");
-    ///     let cause_id = cause.id().unwrap();
+    ///     let cause_id_and_metadata = causality::Span {
+    ///         id: cause.id().unwrap(),
+    ///         metadata: cause.metadata().unwrap()
+    ///     };
     ///
-    ///     let (_trace, cause_updates) = causality::trace(registry, &cause_id, 1024).unwrap();
+    ///     let (_trace, cause_updates) = causality::trace(registry, &cause_id_and_metadata.id, 1024).unwrap();
     ///
     ///     let consequence = cause.in_scope(|| tracing::trace_span!("consequence"));
-    ///     let consequence_id = consequence.id().unwrap();
+    ///     let consequence_id_and_metadata = causality::Span {
+    ///         id: consequence.id().unwrap(),
+    ///         metadata: consequence.metadata().unwrap()
+    ///     };
     ///
     ///     assert_eq!(
     ///         cause_updates.drain().collect::<Vec<_>>(),
     ///         vec![Update::OpenDirect {
-    ///             cause: cause_id.clone(),
-    ///             consequence: consequence_id.clone(),
+    ///             cause: cause_id_and_metadata,
+    ///             consequence: consequence_id_and_metadata,
     ///         }],
     ///         "The listeners on `cause` should be notified that it has a \
     ///         direct `consequence`."
     ///     );
     /// }
     /// ```
-    OpenDirect { cause: Id, consequence: Id },
+    OpenDirect { cause: Span, consequence: Span },
 
     /// Announces that `consequence` **indirectly** follows from `cause`.
     ///
@@ -306,27 +374,33 @@ pub enum Update {
     ///     let registry = subscriber.downcast_ref::<Registry>().unwrap();
     ///
     ///     let cause = tracing::trace_span!("cause");
-    ///     let cause_id = cause.id().unwrap();
+    ///     let cause_id_and_metadata = causality::Span {
+    ///         id: cause.id().unwrap(),
+    ///         metadata: cause.metadata().unwrap()
+    ///     };
     ///
-    ///     let (_trace, cause_updates) = causality::trace(registry, &cause_id, 1024).unwrap();
+    ///     let (_trace, cause_updates) = causality::trace(registry, &cause_id_and_metadata.id, 1024).unwrap();
     ///
     ///     let consequence = tracing::trace_span!("consequence");
-    ///     let consequence_id = consequence.id().unwrap();
+    ///     let consequence_id_and_metadata = causality::Span {
+    ///         id: consequence.id().unwrap(),
+    ///         metadata: consequence.metadata().unwrap()
+    ///     };
     ///     
-    ///     consequence.follows_from(&cause_id);
+    ///     consequence.follows_from(&cause_id_and_metadata.id);
     ///
     ///     assert_eq!(
     ///         cause_updates.drain().collect::<Vec<_>>(),
     ///         vec![Update::NewIndirect {
-    ///             cause: cause_id.clone(),
-    ///             consequence: consequence_id.clone(),
+    ///             cause: cause_id_and_metadata.clone(),
+    ///             consequence: consequence_id_and_metadata.clone(),
     ///         }],
     ///         "The listeners on `cause` should be notified that it has a \
     ///         indirect `consequence`."
     ///     );
     /// }
     /// ```
-    NewIndirect { cause: Id, consequence: Id },
+    NewIndirect { cause: Span, consequence: Span },
 
     /// Announces that a direct consequence of a `Span` within [`Trace`] was
     /// closed, and is thus no longer an extant consequence of `direct_cause`.
@@ -346,27 +420,33 @@ pub enum Update {
     ///     let registry = subscriber.downcast_ref::<Registry>().unwrap();
     ///
     ///     let cause = tracing::trace_span!("cause");
-    ///     let cause_id = cause.id().unwrap();
+    ///     let cause_id_and_metadata = causality::Span {
+    ///         id: cause.id().unwrap(),
+    ///         metadata: cause.metadata().unwrap()
+    ///     };
     ///
     ///     let consequence = cause.in_scope(|| tracing::trace_span!("consequence"));
-    ///     let consequence_id = consequence.id().unwrap();
+    ///     let consequence_id_and_metadata = causality::Span {
+    ///         id: consequence.id().unwrap(),
+    ///         metadata: consequence.metadata().unwrap()
+    ///     };
     ///
-    ///     let (_trace, cause_updates) = causality::trace(registry, &cause_id, 1024).unwrap();
+    ///     let (_trace, cause_updates) = causality::trace(registry, &cause_id_and_metadata.id, 1024).unwrap();
     ///
     ///     drop(consequence);
     ///
     ///     assert_eq!(
     ///         cause_updates.drain().collect::<Vec<_>>(),
     ///         vec![Update::CloseDirect {
-    ///             id: consequence_id.clone(),
-    ///             direct_cause: Some(cause_id),
+    ///             span: consequence_id_and_metadata.clone(),
+    ///             direct_cause: Some(cause_id_and_metadata),
     ///         }],
     ///         "The listeners on `cause` should be notified that
     ///         `consequence` was closed."
     ///     );
     /// }
     /// ```
-    CloseDirect { id: Id, direct_cause: Option<Id> },
+    CloseDirect { span: Span, direct_cause: Option<Span> },
 
     /// Announces that an indirect consequence of a `Span` within [`Trace`] was
     /// closed, and is thus no longer an extant consequence of `indirect_causes`.
@@ -386,29 +466,35 @@ pub enum Update {
     ///     let registry = subscriber.downcast_ref::<Registry>().unwrap();
     ///
     ///     let cause = tracing::trace_span!("cause");
-    ///     let cause_id = cause.id().unwrap();
+    ///     let cause_id_and_metadata = causality::Span {
+    ///         id: cause.id().unwrap(),
+    ///         metadata: cause.metadata().unwrap()
+    ///     };
     ///
     ///     let consequence = tracing::trace_span!("consequence");
-    ///     let consequence_id = consequence.id().unwrap();
+    ///     let consequence_id_and_metadata = causality::Span {
+    ///         id: consequence.id().unwrap(),
+    ///         metadata: consequence.metadata().unwrap()
+    ///     };
     ///
-    ///     consequence.follows_from(&cause_id);
+    ///     consequence.follows_from(&cause_id_and_metadata.id);
     ///
-    ///     let (_trace, cause_updates) = causality::trace(registry, &cause_id, 1024).unwrap();
+    ///     let (_trace, cause_updates) = causality::trace(registry, &cause_id_and_metadata.id, 1024).unwrap();
     ///
     ///     drop(consequence);
     ///
     ///     assert_eq!(
     ///         cause_updates.drain().collect::<Vec<_>>(),
     ///         vec![Update::CloseIndirect {
-    ///             id: consequence_id.clone(),
-    ///             indirect_causes: vec![cause_id],
+    ///             span: consequence_id_and_metadata,
+    ///             indirect_causes: vec![cause_id_and_metadata],
     ///         }],
     ///         "The listeners on `cause` should be notified that
     ///         `consequence` was closed."
     ///     );
     /// }
     /// ```
-    CloseIndirect { id: Id, indirect_causes: Vec<Id> },
+    CloseIndirect { span: Span, indirect_causes: Vec<Span> },
 
     /// Announces that a self-cycling consequence of a `Span` within [`Trace`]
     /// was closed, and is thus no longer an extant consequence of
@@ -429,23 +515,29 @@ pub enum Update {
     ///     let registry = subscriber.downcast_ref::<Registry>().unwrap();
     ///
     ///     let cause = tracing::trace_span!("cause");
-    ///     let cause_id = cause.id().unwrap();
+    ///     let cause_id_and_metadata = causality::Span {
+    ///         id: cause.id().unwrap(),
+    ///         metadata: cause.metadata().unwrap()
+    ///     };
     ///
     ///     let consequence = cause.clone();
-    ///     let consequence_id = consequence.id().unwrap();
+    ///     let consequence_id_and_metadata = causality::Span {
+    ///         id: consequence.id().unwrap(),
+    ///         metadata: consequence.metadata().unwrap()
+    ///     };
     ///
-    ///     consequence.follows_from(&cause_id);
+    ///     consequence.follows_from(&cause_id_and_metadata.id);
     ///
-    ///     let (_trace, cause_updates) = causality::trace(registry, &cause_id, 1024).unwrap();
+    ///     let (_trace, cause_updates) = causality::trace(registry, &cause_id_and_metadata.id, 1024).unwrap();
     ///
     ///     drop([cause, consequence]);
     ///
     ///     assert_eq!(
     ///         cause_updates.into_iter().collect::<Vec<_>>(),
     ///         vec![Update::CloseCyclic {
-    ///             id: consequence_id.clone(),
+    ///             span: consequence_id_and_metadata.clone(),
     ///             direct_cause: None,
-    ///             indirect_causes: vec![cause_id.clone()],
+    ///             indirect_causes: vec![cause_id_and_metadata.clone()],
     ///         }],
     ///         "The listeners on `cause` should be notified that
     ///         `consequence` was closed."
@@ -453,9 +545,9 @@ pub enum Update {
     /// }
     /// ```
     CloseCyclic {
-        id: Id,
-        direct_cause: Option<Id>,
-        indirect_causes: Vec<Id>,
+        span: Span,
+        direct_cause: Option<Span>,
+        indirect_causes: Vec<Span>,
     },
 }
 
@@ -474,19 +566,23 @@ impl Layer {
         use data::IndirectCauses;
         let span = ctx.span(span_id).expect("Span not found, this is a bug");
         let mut span_data = span.extensions_mut();
+        let id_and_metadata = Span {
+            id: span_id.to_owned(),
+            metadata: span.metadata(),
+        };
 
         // 1. insert `consequence` as an indirect consequence of `cause`
         if let Some(consequences) = span_data.get_mut::<Consequences>() {
-            consequences.indirect.insert(span_id.to_owned());
+            consequences.indirect.insert(id_and_metadata.clone());
         } else {
-            span_data.insert(Consequences::with_indirect(span_id.to_owned()));
+            span_data.insert(Consequences::with_indirect(id_and_metadata.clone()));
         }
 
         // 2. insert `cause` as an indirect cause of `consequence`
         if let Some(follows_from) = span_data.get_mut::<IndirectCauses>() {
-            follows_from.add_cause(span_id.to_owned());
+            follows_from.add_cause(id_and_metadata.clone());
         } else {
-            span_data.insert(IndirectCauses::with_cause(span_id.to_owned()));
+            span_data.insert(IndirectCauses::with_cause(id_and_metadata.clone()));
         }
 
         if let Some(listeners) = span_data.get_mut::<Listeners>() {
@@ -494,8 +590,8 @@ impl Layer {
             channel::Sender::broadcast(
                 listeners,
                 Update::NewIndirect {
-                    cause: span_id.clone(),
-                    consequence: span_id.clone(),
+                    cause: id_and_metadata.clone(),
+                    consequence: id_and_metadata.clone(),
                 },
             );
         }
@@ -514,18 +610,25 @@ where
             already been closed, or been assigned by a different subscriber, \
             or there may be a bug in the subscriber underlying this layer.",
         );
+        let consequence_id_and_metadata = Span {
+            id: id.to_owned(),
+            metadata: span.metadata(),
+        };
 
         if let Some(direct_cause) = span.parent() {
             let mut cause_extensions = direct_cause.extensions_mut();
-            let id = id.to_owned();
+            let cause_id_and_metadata = Span {
+                id: direct_cause.id(),
+                metadata: direct_cause.metadata(),
+            };
 
             if let Some(listeners) = cause_extensions.get_mut::<Listeners>() {
                 // 1. notify listeners, if any, that `id` is a consequence
                 channel::Sender::broadcast(
                     listeners,
                     Update::OpenDirect {
-                        cause: direct_cause.id(),
-                        consequence: id.clone(),
+                        cause: cause_id_and_metadata,
+                        consequence: consequence_id_and_metadata.clone(),
                     },
                 );
 
@@ -536,51 +639,61 @@ where
 
             // 3. register that `cause` directly lead to `consequence`.
             if let Some(consequences) = cause_extensions.get_mut::<Consequences>() {
-                consequences.direct.insert(id);
+                consequences.direct.insert(consequence_id_and_metadata);
             } else {
-                cause_extensions.insert(Consequences::with_direct(id));
+                cause_extensions.insert(Consequences::with_direct(consequence_id_and_metadata));
             }
         }
     }
 
-    fn on_follows_from(&self, consequence_id: &Id, cause_id: &Id, ctx: Context<'_, S>) {
+    fn on_follows_from(&self, consequence_id_and_metadata: &Id, cause_id_and_metadata: &Id, ctx: Context<'_, S>) {
         use data::IndirectCauses;
 
-        if cause_id == consequence_id {
-            return self.on_follows_self(consequence_id, ctx);
+        if cause_id_and_metadata == consequence_id_and_metadata {
+            return self.on_follows_self(consequence_id_and_metadata, ctx);
         }
 
-        let cause = ctx.span(cause_id).expect(
-            "The `cause_id` provided to 
+        let cause = ctx.span(cause_id_and_metadata).expect(
+            "The `cause_id_and_metadata` provided to 
             `tracing_causality::Layer::on_follows_from` did not correspond to \
             an opened `Span` for the underlying subscriber. This span may have \
             already been closed, or been assigned by a different subscriber, \
             or there may be a bug in the subscriber underlying this layer.",
         );
 
-        let consequence = ctx.span(consequence_id).expect(
-            "The `consequence_id` provided to 
+        let consequence = ctx.span(consequence_id_and_metadata).expect(
+            "The `consequence_id_and_metadata` provided to 
             `tracing_causality::Layer::on_follows_from` did not correspond to \
             an opened `Span` for the underlying subscriber. This span may have \
             already been closed, or been assigned by a different subscriber, \
             or there may be a bug in the subscriber underlying this layer.",
         );
+
+        let cause_id_and_metadata = Span {
+            id: cause_id_and_metadata.to_owned(),
+            metadata: cause.metadata(),
+        };
+
+        let consequence_id_and_metadata = Span {
+            id: consequence_id_and_metadata.to_owned(),
+            metadata: consequence.metadata(),
+        };
 
         let mut cause_data = cause.extensions_mut();
         let mut consequence_data = consequence.extensions_mut();
 
         // 1. insert `consequence` as an indirect consequence of `cause`
         if let Some(consequences) = cause_data.get_mut::<Consequences>() {
-            consequences.indirect.insert(consequence_id.to_owned());
+            consequences.indirect.insert(consequence_id_and_metadata.clone());
         } else {
-            cause_data.insert(Consequences::with_indirect(consequence_id.to_owned()));
+            cause_data.insert(Consequences::with_indirect(consequence_id_and_metadata.clone()));
         }
 
         // 2. insert `cause` as an indirect cause of `consequence`
         if let Some(follows_from) = consequence_data.get_mut::<IndirectCauses>() {
-            follows_from.add_cause(cause_id.to_owned());
+            follows_from.add_cause(cause_id_and_metadata.clone());
         } else {
-            consequence_data.insert(IndirectCauses::with_cause(cause_id.to_owned()));
+            consequence_data.insert(IndirectCauses::with_cause(cause_id_and_metadata.clone()));
         }
 
         if let Some(listeners) = cause_data.get_mut::<Listeners>() {
@@ -588,8 +701,8 @@ where
             channel::Sender::broadcast(
                 listeners,
                 Update::NewIndirect {
-                    cause: cause_id.clone(),
-                    consequence: consequence_id.clone(),
+                    cause: cause_id_and_metadata,
+                    consequence: consequence_id_and_metadata,
                 },
             );
         }
@@ -607,35 +720,40 @@ where
 
         let mut extensions = span.extensions_mut();
 
+        let closed_id_and_metadata = Span {
+            id: id.to_owned(),
+            metadata: span.metadata(),
+        };
+
         // `None` if this span is not its own immediate indirect cause,
         // otherwise `Some(indirect_causes)`.
         let mut is_cyclic = None;
 
         // 1. delete `id` as a consequence from each of its indirect causes
         if let Some(follows_from) = extensions.remove::<IndirectCauses>() {
-            let indirect_causes: Vec<Id> = follows_from.causes.into_iter().collect();
+            let indirect_causes: Vec<Span> = follows_from.causes.into_iter().collect();
 
             let drop_update = Update::CloseIndirect {
-                id: id.clone(),
+                span: closed_id_and_metadata.clone(),
                 indirect_causes: indirect_causes.clone(),
             };
 
-            for cause_id in &indirect_causes {
-                if cause_id == &id {
+            for cause in &indirect_causes {
+                if &cause.id == &id {
                     is_cyclic = Some(indirect_causes.clone());
                     continue;
-                } else if let Some(cause) = ctx.span(cause_id) {
+                } else if let Some(cause) = ctx.span(&cause.id) {
                     let mut extensions = cause.extensions_mut();
 
                     if let Some(consequences) = extensions.get_mut::<Consequences>() {
-                        consequences.remove_indirect(&id);
+                        consequences.remove_indirect(&closed_id_and_metadata);
                     }
 
                     if let Some(listeners) = extensions.get_mut::<Listeners>() {
                         channel::Sender::broadcast(listeners, drop_update.clone());
                     }
                 } else {
-                    // `cause_id` corresponds to a `Span` that has already been
+                    // `cause_id_and_metadata` corresponds to a `Span` that has already been
                     // closed. TODO: investigate this case by throwing a panic
                     // here, and writing unit tests that trigger it.
                 }
@@ -648,7 +766,7 @@ where
         if let Some(parent) = &direct_cause {
             let mut parent_extensions = parent.extensions_mut();
             if let Some(consequences) = parent_extensions.get_mut::<Consequences>() {
-                consequences.remove_direct(&id);
+                consequences.remove_direct(&closed_id_and_metadata);
             }
         }
 
@@ -656,14 +774,14 @@ where
         if let Some(listeners) = extensions.get_mut::<Listeners>() {
             let update = if let Some(indirect_causes) = is_cyclic {
                 Update::CloseCyclic {
-                    id: id.clone(),
-                    direct_cause: direct_cause.map(|c| c.id()),
+                    span: closed_id_and_metadata,
+                    direct_cause: direct_cause.map(|c| Span { id: c.id(), metadata: c.metadata() }),
                     indirect_causes,
                 }
             } else {
                 Update::CloseDirect {
-                    id,
-                    direct_cause: direct_cause.map(|c| c.id()),
+                    span: closed_id_and_metadata,
+                    direct_cause: direct_cause.map(|c| Span { id: c.id(), metadata: c.metadata() }),
                 }
             };
             channel::Sender::broadcast(listeners, update);
@@ -763,21 +881,24 @@ mod test {
             let registry = subscriber.downcast_ref::<Registry>().unwrap();
 
             let a = tracing::trace_span!("a");
-            let a_id = a.id().unwrap();
+            let a_id_and_metadata = causality::Span {
+                id: a.id().unwrap(),
+                metadata: a.metadata().unwrap(),
+            };
 
             assert!(registry
-                .span_data(&a_id)
+                .span_data(&a_id_and_metadata.id)
                 .unwrap()
                 .extensions()
                 .get::<crate::Listeners>()
                 .is_none());
 
-            let (_trace, _updates) = causality::trace(registry, &a_id, 1024).unwrap();
+            let (_trace, _updates) = causality::trace(registry, &a_id_and_metadata.id, 1024).unwrap();
 
             // after `trace`, there should be 1 listener on `a`
             assert_eq!(
                 registry
-                    .span_data(&a_id)
+                    .span_data(&a_id_and_metadata.id)
                     .unwrap()
                     .extensions()
                     .get::<crate::Listeners>()
@@ -796,31 +917,37 @@ mod test {
             let registry = subscriber.downcast_ref::<Registry>().unwrap();
 
             let a = tracing::trace_span!("a");
-            let a_id = a.id().unwrap();
+            let a_id_and_metadata = causality::Span {
+                id: a.id().unwrap(),
+                metadata: a.metadata().unwrap(),
+            };
 
             let b = a.in_scope(|| tracing::trace_span!("b"));
-            let b_id = b.id().unwrap();
+            let b_id_and_metadata = causality::Span {
+                id: b.id().unwrap(),
+                metadata: b.metadata().unwrap(),
+            };
 
             assert!(registry
-                .span_data(&a_id)
+                .span_data(&a_id_and_metadata.id)
                 .unwrap()
                 .extensions()
                 .get::<crate::Listeners>()
                 .is_none());
 
             assert!(registry
-                .span_data(&b_id)
+                .span_data(&b_id_and_metadata.id)
                 .unwrap()
                 .extensions()
                 .get::<crate::Listeners>()
                 .is_none());
 
-            let (_trace, _updates) = causality::trace(registry, &a_id, 1024).unwrap();
+            let (_trace, _updates) = causality::trace(registry, &a_id_and_metadata.id, 1024).unwrap();
 
             // after `trace`, there should be 1 listener on `a`
             assert_eq!(
                 registry
-                    .span_data(&a_id)
+                    .span_data(&a_id_and_metadata.id)
                     .unwrap()
                     .extensions()
                     .get::<crate::Listeners>()
@@ -832,7 +959,7 @@ mod test {
             // after `trace`, there should be 1 listener on `b`
             assert_eq!(
                 registry
-                    .span_data(&b_id)
+                    .span_data(&b_id_and_metadata.id)
                     .unwrap()
                     .extensions()
                     .get::<crate::Listeners>()
@@ -851,31 +978,37 @@ mod test {
             let registry = subscriber.downcast_ref::<Registry>().unwrap();
 
             let a = tracing::trace_span!("a");
-            let a_id = a.id().unwrap();
+            let a_id_and_metadata = causality::Span {
+                id: a.id().unwrap(),
+                metadata: a.metadata().unwrap(),
+            };
 
             let b = a.in_scope(|| tracing::trace_span!("b"));
-            let b_id = b.id().unwrap();
+            let b_id_and_metadata = causality::Span {
+                id: b.id().unwrap(),
+                metadata: b.metadata().unwrap(),
+            };
 
             assert!(registry
-                .span_data(&a_id)
+                .span_data(&a_id_and_metadata.id)
                 .unwrap()
                 .extensions()
                 .get::<crate::Listeners>()
                 .is_none());
 
             assert!(registry
-                .span_data(&b_id)
+                .span_data(&b_id_and_metadata.id)
                 .unwrap()
                 .extensions()
                 .get::<crate::Listeners>()
                 .is_none());
 
             // trace `b`
-            let (_trace, _updates) = causality::trace(registry, &b_id, 1024).unwrap();
+            let (_trace, _updates) = causality::trace(registry, &b_id_and_metadata.id, 1024).unwrap();
 
             // after `trace`, there should be 0 listeners on `a`
             assert!(registry
-                .span_data(&a_id)
+                .span_data(&a_id_and_metadata.id)
                 .unwrap()
                 .extensions()
                 .get::<crate::Listeners>()
@@ -884,7 +1017,7 @@ mod test {
             // after `trace`, there should be 1 listener on `b`
             assert_eq!(
                 registry
-                    .span_data(&b_id)
+                    .span_data(&b_id_and_metadata.id)
                     .unwrap()
                     .extensions()
                     .get::<crate::Listeners>()
@@ -894,12 +1027,12 @@ mod test {
             );
 
             // trace `a`
-            let (_trace, _updates) = causality::trace(registry, &a_id, 1024).unwrap();
+            let (_trace, _updates) = causality::trace(registry, &a_id_and_metadata.id, 1024).unwrap();
 
             // after `trace`, there should be 1 listener on `a`
             assert_eq!(
                 registry
-                    .span_data(&a_id)
+                    .span_data(&a_id_and_metadata.id)
                     .unwrap()
                     .extensions()
                     .get::<crate::Listeners>()
@@ -911,7 +1044,7 @@ mod test {
             // after `trace`, there should be 2 listeners on `b`
             assert_eq!(
                 registry
-                    .span_data(&b_id)
+                    .span_data(&b_id_and_metadata.id)
                     .unwrap()
                     .extensions()
                     .get::<crate::Listeners>()
@@ -937,22 +1070,25 @@ mod test {
                 let registry = subscriber.downcast_ref::<Registry>().unwrap();
 
                 let a = tracing::trace_span!("a");
-                let a_id = a.id().unwrap();
+                let a_id_and_metadata = causality::Span {
+                    id: a.id().unwrap(),
+                    metadata: a.metadata().unwrap(),
+                };
 
                 // prior to `trace`, there are no listeners on `a`
                 assert!(registry
-                    .span_data(&a_id)
+                    .span_data(&a_id_and_metadata.id)
                     .unwrap()
                     .extensions()
                     .get::<crate::Listeners>()
                     .is_none());
 
-                let (_trace, updates) = causality::trace(registry, &a_id, 1024).unwrap();
+                let (_trace, updates) = causality::trace(registry, &a_id_and_metadata.id, 1024).unwrap();
 
                 // after `trace`, there should be 1 listener on `a`
                 assert_eq!(
                     registry
-                        .span_data(&a_id)
+                        .span_data(&a_id_and_metadata.id)
                         .unwrap()
                         .extensions()
                         .get::<crate::Listeners>()
@@ -962,13 +1098,16 @@ mod test {
                 );
 
                 let b = a.in_scope(|| tracing::trace_span!("b"));
-                let b_id = b.id().unwrap();
+                let b_id_and_metadata = causality::Span {
+                    id: b.id().unwrap(),
+                    metadata: b.metadata().unwrap(),
+                };
 
                 assert_eq!(
                     updates.next(),
                     Some(Update::OpenDirect {
-                        cause: a_id,
-                        consequence: b_id,
+                        cause: a_id_and_metadata,
+                        consequence: b_id_and_metadata,
                     })
                 );
 
@@ -986,17 +1125,23 @@ mod test {
                 let registry = subscriber.downcast_ref::<Registry>().unwrap();
 
                 let a = tracing::trace_span!("a");
-                let a_id = a.id().unwrap();
+                let a_id_and_metadata = causality::Span {
+                    id: a.id().unwrap(),
+                    metadata: a.metadata().unwrap(),
+                };
 
-                let (_trace, _updates) = causality::trace(registry, &a_id, 1024).unwrap();
+                let (_trace, _updates) = causality::trace(registry, &a_id_and_metadata.id, 1024).unwrap();
 
                 let b = a.in_scope(|| tracing::trace_span!("b"));
-                let b_id = b.id().unwrap();
+                let b_id_and_metadata = causality::Span {
+                    id: b.id().unwrap(),
+                    metadata: b.metadata().unwrap(),
+                };
 
-                let (_trace, _updates) = causality::trace(registry, &b_id, 1024).unwrap();
+                let (_trace, _updates) = causality::trace(registry, &b_id_and_metadata.id, 1024).unwrap();
 
                 let a_listeners = registry
-                    .span_data(&a_id)
+                    .span_data(&a_id_and_metadata.id)
                     .unwrap()
                     .extensions()
                     .get::<crate::Listeners>()
@@ -1004,7 +1149,7 @@ mod test {
                     .clone();
 
                 let b_listeners = registry
-                    .span_data(&b_id)
+                    .span_data(&b_id_and_metadata.id)
                     .unwrap()
                     .extensions()
                     .get::<crate::Listeners>()
@@ -1037,9 +1182,12 @@ mod test {
                 let registry = subscriber.downcast_ref::<Registry>().unwrap();
 
                 let a = tracing::trace_span!("a");
-                let a_id = a.id().unwrap();
+                let a_id_and_metadata = causality::Span {
+                    id: a.id().unwrap(),
+                    metadata: a.metadata().unwrap(),
+                };
 
-                let a_consequences = causality::consequences(registry, &a_id)
+                let a_consequences = causality::consequences(registry, &a_id_and_metadata.id)
                     .expect("span `a` should not have been closed yet");
 
                 assert_eq!(
@@ -1049,14 +1197,17 @@ mod test {
                 );
 
                 let b = a.in_scope(|| tracing::trace_span!("b"));
-                let b_id = b.id().unwrap();
+                let b_id_and_metadata = causality::Span {
+                    id: b.id().unwrap(),
+                    metadata: b.metadata().unwrap(),
+                };
 
-                let a_consequences = causality::consequences(registry, &a_id)
+                let a_consequences = causality::consequences(registry, &a_id_and_metadata.id)
                     .expect("span `a` should not have been closed yet");
 
                 assert_eq!(
                     a_consequences,
-                    Consequences::with_direct(b_id),
+                    Consequences::with_direct(b_id_and_metadata),
                     "span `a` should only have the direct consequence `b`"
                 );
             }
@@ -1077,12 +1228,18 @@ mod test {
                 let registry = subscriber.downcast_ref::<Registry>().unwrap();
 
                 let cause = tracing::trace_span!("cause");
-                let cause_id = cause.id().unwrap();
+                let cause_id_and_metadata = causality::Span {
+                    id: cause.id().unwrap(),
+                    metadata: cause.metadata().unwrap(),
+                };
 
                 let consequence = tracing::trace_span!("consequence");
-                let consequence_id = consequence.id().unwrap();
+                let consequence_id_and_metadata = causality::Span {
+                    id: consequence.id().unwrap(),
+                    metadata: consequence.metadata().unwrap(),
+                };
 
-                let consequences = causality::consequences(registry, &cause_id)
+                let consequences = causality::consequences(registry, &cause_id_and_metadata.id)
                     .expect("span `cause` should not have been closed yet");
 
                 assert_eq!(
@@ -1091,14 +1248,14 @@ mod test {
                     "span `cause` should not have any consequences"
                 );
 
-                consequence.follows_from(&cause_id);
+                consequence.follows_from(&cause_id_and_metadata.id);
 
-                let consequences = causality::consequences(registry, &cause_id)
+                let consequences = causality::consequences(registry, &cause_id_and_metadata.id)
                     .expect("span `cause` should not have been closed yet");
 
                 assert_eq!(
                     consequences,
-                    Consequences::with_indirect(consequence_id),
+                    Consequences::with_indirect(consequence_id_and_metadata),
                     "span `cause` should have an indirect `consequence`"
                 );
             }
@@ -1115,14 +1272,20 @@ mod test {
                 let registry = subscriber.downcast_ref::<Registry>().unwrap();
 
                 let cause = tracing::trace_span!("cause");
-                let cause_id = cause.id().unwrap();
+                let cause_id_and_metadata = causality::Span {
+                    id: cause.id().unwrap(),
+                    metadata: cause.metadata().unwrap(),
+                };
 
                 let consequence = tracing::trace_span!("consequence");
-                let consequence_id = consequence.id().unwrap();
+                let consequence_id_and_metadata = causality::Span {
+                    id: consequence.id().unwrap(),
+                    metadata: consequence.metadata().unwrap(),
+                };
 
                 assert!(
                     registry
-                        .span_data(&consequence_id)
+                        .span_data(&consequence_id_and_metadata.id)
                         .expect("span `consequence` should not yet be closed.")
                         .extensions()
                         .get::<crate::data::IndirectCauses>()
@@ -1130,17 +1293,17 @@ mod test {
                     "span `consequence` should not yet have `IndirectCauses`"
                 );
 
-                consequence.follows_from(&cause_id);
+                consequence.follows_from(&cause_id_and_metadata.id);
 
                 assert!(
                     registry
-                        .span_data(&consequence_id)
+                        .span_data(&consequence_id_and_metadata.id)
                         .expect("span `consequence` should not yet be closed.")
                         .extensions()
                         .get::<crate::data::IndirectCauses>()
                         .expect("span `consequence` should have `IndirectCauses`")
-                        .contains(&cause_id),
-                    "`consequence`'s `IndirectCauses` should contain `cause_id`"
+                        .contains(&cause_id_and_metadata),
+                    "`consequence`'s `IndirectCauses` should contain `cause_id_and_metadata`"
                 );
             }
 
@@ -1155,19 +1318,25 @@ mod test {
                 let registry = subscriber.downcast_ref::<Registry>().unwrap();
 
                 let cause = tracing::trace_span!("cause");
-                let cause_id = cause.id().unwrap();
+                let cause_id_and_metadata = causality::Span {
+                    id: cause.id().unwrap(),
+                    metadata: cause.metadata().unwrap(),
+                };
 
                 let consequence = tracing::trace_span!("consequence");
-                let consequence_id = consequence.id().unwrap();
+                let consequence_id_and_metadata = causality::Span {
+                    id: consequence.id().unwrap(),
+                    metadata: consequence.metadata().unwrap(),
+                };
 
-                let (_trace, cause_updates) = crate::trace(registry, &cause_id, 1024).unwrap();
+                let (_trace, cause_updates) = crate::trace(registry, &cause_id_and_metadata.id, 1024).unwrap();
                 let (_trace, consequence_updates) =
-                    crate::trace(registry, &consequence_id, 1024).unwrap();
+                    crate::trace(registry, &consequence_id_and_metadata.id, 1024).unwrap();
 
                 assert!(consequence_updates.is_empty());
                 assert!(cause_updates.is_empty());
 
-                consequence.follows_from(&cause_id);
+                consequence.follows_from(&cause_id_and_metadata.id);
 
                 assert!(
                     consequence_updates.is_empty(),
@@ -1177,8 +1346,8 @@ mod test {
                 assert_eq!(
                     cause_updates.next(),
                     Some(Update::NewIndirect {
-                        cause: cause_id.clone(),
-                        consequence: consequence_id.clone(),
+                        cause: cause_id_and_metadata.clone(),
+                        consequence: consequence_id_and_metadata.clone(),
                     }),
                     "The listeners on `cause` should be notified that \
                     `consequence` indirectly follows from `cause`."
@@ -1202,34 +1371,40 @@ mod test {
                 let registry = subscriber.downcast_ref::<Registry>().unwrap();
 
                 let cause = tracing::trace_span!("cause");
-                let cause_id = cause.id().unwrap();
+                let cause_id_and_metadata = causality::Span {
+                    id: cause.id().unwrap(),
+                    metadata: cause.metadata().unwrap(),
+                };;
 
                 let consequence = tracing::trace_span!("consequence");
-                let consequence_id = consequence.id().unwrap();
+                let consequence_id_and_metadata = causality::Span {
+                    id: consequence.id().unwrap(),
+                    metadata: consequence.metadata().unwrap(),
+                };
 
-                let (_trace, _updates) = crate::trace(registry, &cause_id, 1024).unwrap();
-                let (_trace, _updates) = crate::trace(registry, &consequence_id, 1024).unwrap();
+                let (_trace, _updates) = crate::trace(registry, &cause_id_and_metadata.id, 1024).unwrap();
+                let (_trace, _updates) = crate::trace(registry, &consequence_id_and_metadata.id, 1024).unwrap();
 
                 assert_eq!(
-                    causality::consequences(registry, &cause_id)
+                    causality::consequences(registry, &cause_id_and_metadata.id)
                         .expect("span `cause` should not have been closed yet"),
                     Consequences::default(),
                     "span `cause` should not have any consequences"
                 );
 
-                consequence.follows_from(&cause_id);
+                consequence.follows_from(&cause_id_and_metadata.id);
 
                 assert_eq!(
-                    causality::consequences(registry, &cause_id)
+                    causality::consequences(registry, &cause_id_and_metadata.id)
                         .expect("span `cause` should not have been closed yet"),
-                    Consequences::with_indirect(consequence_id.clone()),
+                    Consequences::with_indirect(consequence_id_and_metadata.clone()),
                     "span `cause` should have one indirect consequence"
                 );
 
                 drop(consequence);
 
                 assert_eq!(
-                    causality::consequences(registry, &cause_id)
+                    causality::consequences(registry, &cause_id_and_metadata.id)
                         .expect("span `cause` should not have been closed yet"),
                     Consequences::default(),
                     "span `cause` should not have any consequences"
@@ -1248,24 +1423,30 @@ mod test {
                 let registry = subscriber.downcast_ref::<Registry>().unwrap();
 
                 let cause = tracing::trace_span!("cause");
-                let cause_id = cause.id().unwrap();
+                let cause_id_and_metadata = causality::Span {
+                    id: cause.id().unwrap(),
+                    metadata: cause.metadata().unwrap(),
+                };
 
                 let consequence = tracing::trace_span!("consequence");
-                let consequence_id = consequence.id().unwrap();
+                let consequence_id_and_metadata = causality::Span {
+                    id: consequence.id().unwrap(),
+                    metadata: consequence.metadata().unwrap(),
+                };
 
-                consequence.follows_from(&cause_id);
+                consequence.follows_from(&cause_id_and_metadata.id);
 
-                let (_trace, cause_updates) = crate::trace(registry, &cause_id, 1024).unwrap();
+                let (_trace, cause_updates) = crate::trace(registry, &cause_id_and_metadata.id, 1024).unwrap();
                 let (_trace, _consequence_updates) =
-                    crate::trace(registry, &consequence_id, 1024).unwrap();
+                    crate::trace(registry, &consequence_id_and_metadata.id, 1024).unwrap();
 
                 drop(consequence);
 
                 assert_eq!(
                     cause_updates.next(),
                     Some(Update::CloseIndirect {
-                        id: consequence_id.clone(),
-                        indirect_causes: vec![cause_id.clone()],
+                        span: consequence_id_and_metadata.clone(),
+                        indirect_causes: vec![cause_id_and_metadata.clone()],
                     }),
                     "The listeners on `cause` should be notified that
                     `consequence` was closed."
@@ -1285,25 +1466,31 @@ mod test {
                 let registry = subscriber.downcast_ref::<Registry>().unwrap();
 
                 let cause = tracing::trace_span!("cause");
-                let cause_id = cause.id().unwrap();
+                let cause_id_and_metadata = causality::Span {
+                    id: cause.id().unwrap(),
+                    metadata: cause.metadata().unwrap(),
+                };
 
                 let consequence = cause.clone();
-                let consequence_id = consequence.id().unwrap();
+                let consequence_id_and_metadata = causality::Span {
+                    id: consequence.id().unwrap(),
+                    metadata: consequence.metadata().unwrap(),
+                };
 
-                consequence.follows_from(&cause_id);
+                consequence.follows_from(&cause_id_and_metadata.id);
 
-                let (_trace, cause_updates) = crate::trace(registry, &cause_id, 1024).unwrap();
+                let (_trace, cause_updates) = crate::trace(registry, &cause_id_and_metadata.id, 1024).unwrap();
                 let (_trace, _consequence_updates) =
-                    crate::trace(registry, &consequence_id, 1024).unwrap();
+                    crate::trace(registry, &consequence_id_and_metadata.id, 1024).unwrap();
 
                 drop([cause, consequence]);
 
                 assert_eq!(
                     cause_updates.next(),
                     Some(Update::CloseCyclic {
-                        id: consequence_id.clone(),
+                        span: consequence_id_and_metadata.clone(),
                         direct_cause: None,
-                        indirect_causes: vec![cause_id.clone()],
+                        indirect_causes: vec![cause_id_and_metadata.clone()],
                     }),
                     "The listeners on `cause` should be notified that
                     `consequence` was closed."
@@ -1317,6 +1504,7 @@ mod test {
 
 #[cfg(test)]
 mod test2 {
+    use crate::{self as causality, Consequences, Update, Updates};
     use std::sync::Arc;
     use tracing_core::Subscriber;
     use tracing_subscriber::registry::{LookupSpan, SpanData};
@@ -1331,19 +1519,28 @@ mod test2 {
         let subscriber = subscriber.downcast_ref::<Registry>().unwrap();
 
         let a = tracing::trace_span!("a");
-        let a_id = a.id().unwrap();
+        let a_id_and_metadata = causality::Span {
+            id: a.id().unwrap(),
+            metadata: a.metadata().unwrap(),
+        };
 
         let b = a.in_scope(|| tracing::trace_span!("b"));
-        let b_id = b.id().unwrap();
+        let b_id_and_metadata = causality::Span {
+            id: b.id().unwrap(),
+            metadata: b.metadata().unwrap(),
+        };
 
-        let (trace, updates) = crate::trace(subscriber, &a_id, 1).unwrap();
-        assert!(trace.consequences(&a_id).unwrap().contains_direct(&b_id));
+        let (trace, updates) = crate::trace(subscriber, &a_id_and_metadata.id, 1).unwrap();
+        assert!(trace.consequences(&a_id_and_metadata).unwrap().contains_direct(&b_id_and_metadata));
 
         let c = b.in_scope(|| tracing::trace_span!("c"));
-        let c_id = c.id().unwrap();
+        let c_id_and_metadata = causality::Span {
+            id: c.id().unwrap(),
+            metadata: c.metadata().unwrap(),
+        };
 
         dbg!(subscriber
-            .span_data(&b_id)
+            .span_data(&b_id_and_metadata.id)
             .unwrap()
             .extensions()
             .get::<crate::Listeners>()
@@ -1352,8 +1549,8 @@ mod test2 {
         assert_eq!(
             updates.next(),
             Some(crate::Update::OpenDirect {
-                cause: b_id,
-                consequence: c_id,
+                cause: b_id_and_metadata,
+                consequence: c_id_and_metadata,
             })
         );
     }
@@ -1367,222 +1564,53 @@ mod test2 {
         let subscriber = subscriber.downcast_ref::<Registry>().unwrap();
 
         let a = tracing::trace_span!("a");
-        let a_id = a.id().unwrap();
+        let a_id_and_metadata = causality::Span {
+            id: a.id().unwrap(),
+            metadata: a.metadata().unwrap(),
+        };
 
-        let (_trace, updates) = crate::trace(subscriber, &a_id, 1024).unwrap();
+        let (_trace, updates) = crate::trace(subscriber, &a_id_and_metadata.id, 1024).unwrap();
 
         let b = a.in_scope(|| tracing::trace_span!("b"));
-        let b_id = b.id().unwrap();
+        let b_id_and_metadata = causality::Span {
+            id: b.id().unwrap(),
+            metadata: b.metadata().unwrap(),
+        };
 
         let c = b.in_scope(|| tracing::trace_span!("c"));
-        let c_id = c.id().unwrap();
-
-        dbg!(subscriber
-            .span_data(&b_id)
-            .unwrap()
-            .extensions()
-            .get::<crate::Listeners>()
-            .is_some());
-
-        dbg!(subscriber
-            .span_data(&c_id)
-            .unwrap()
-            .extensions()
-            .get::<crate::Listeners>()
-            .is_some());
-
-        assert_eq!(
-            updates.next(),
-            Some(crate::Update::OpenDirect {
-                cause: a_id,
-                consequence: b_id.clone(),
-            })
-        );
-
-        assert_eq!(
-            updates.next(),
-            Some(crate::Update::OpenDirect {
-                cause: b_id,
-                consequence: c_id,
-            })
-        );
-    }
-}
-
-#[cfg(test)]
-mod test_layer {
-    use super::test_util;
-    use std::sync::Arc;
-    use tracing::trace_span;
-    use tracing_core::Subscriber;
-    use tracing_subscriber::{prelude::*, registry::Registry};
-
-    /// Tests the causality layer with on a trace involving a root without
-    /// consequences.
-    #[test]
-    fn root() {
-        let subscriber: Arc<dyn Subscriber + Send + Sync> =
-            Arc::new(Registry::default().with(crate::Layer));
-        let _guard = subscriber.clone().set_default();
-        let subscriber: Arc<dyn Subscriber> = subscriber;
-        let subscriber = subscriber.downcast_ref::<Registry>().unwrap();
-
-        let root = trace_span!("root");
-        let updates = test_util::updates_for(subscriber, &root);
-
-        assert_eq!(
-            test_util::direct_cause_of(subscriber, &root),
-            None,
-            "span `root` should not have any parent"
-        );
-
-        test_util::assert_lacks_consequences(subscriber, &root);
-
-        let root_id = root.id().unwrap();
-        drop(root);
-
-        assert_eq!(
-            updates.next(),
-            Some(crate::Update::CloseDirect {
-                id: root_id,
-                direct_cause: None,
-                //indirect_causes: vec![],
-            }),
-            "listeners on Span `root` should have been updated",
-        );
-    }
-
-    /// Tests the causality layer on a trace involving a root with a single
-    /// direct consequence.
-    #[test]
-    fn direct_consequence() {
-        let subscriber: Arc<dyn Subscriber + Send + Sync> =
-            Arc::new(Registry::default().with(crate::Layer));
-        let _guard = subscriber.clone().set_default();
-        let subscriber: Arc<dyn Subscriber> = subscriber;
-        let subscriber = subscriber.downcast_ref::<Registry>().unwrap();
-
-        let root = trace_span!("root");
-        let root_id = root.id().unwrap();
-        let root_updates = test_util::updates_for(subscriber, &root);
-
-        test_util::assert_lacks_consequences(subscriber, &root);
-
-        assert!(root_updates.is_empty());
-
-        let consequence = root.in_scope(|| trace_span!("consequence"));
-        let consequence_id = consequence.id().unwrap();
-        let consequence_updates = test_util::updates_for(subscriber, &consequence);
-
-        assert_eq!(
-            root_updates.next(),
-            Some(crate::Update::OpenDirect {
-                cause: root.id().unwrap(),
-                consequence: consequence.id().unwrap(),
-            }),
-            "listeners on Span `root` should have been updated",
-        );
-
-        assert!(root_updates.is_empty());
-
-        test_util::assert_lacks_consequences(subscriber, &consequence);
-
-        assert_eq!(
-            test_util::direct_cause_of(subscriber, &consequence),
-            root.id(),
-            "`consequence` should be the direct consequence of `root`"
-        );
-
-        assert_eq!(
-            test_util::consequences_of(subscriber, &root),
-            crate::Consequences::with_direct(consequence.id().unwrap()),
-            "`consequence` should be the direct consequence of `root`"
-        );
-
-        drop(root);
-
-        // `consequence` is still extant, so `root` isn't actually closed
-        assert!(root_updates.is_empty());
-        assert!(consequence_updates.is_empty());
-
-        drop(consequence);
-
-        // `consequence` is closed, because there are no other spans with the same id
-        let consequence_closed_update = crate::Update::CloseDirect {
-            id: consequence_id.clone(),
-            direct_cause: Some(root_id.clone()),
+        let c_id_and_metadata = causality::Span {
+            id: c.id().unwrap(),
+            metadata: c.metadata().unwrap(),
         };
+
+        dbg!(subscriber
+            .span_data(&b_id_and_metadata.id)
+            .unwrap()
+            .extensions()
+            .get::<crate::Listeners>()
+            .is_some());
+
+        dbg!(subscriber
+            .span_data(&c_id_and_metadata.id)
+            .unwrap()
+            .extensions()
+            .get::<crate::Listeners>()
+            .is_some());
+
         assert_eq!(
-            consequence_updates.next(),
-            Some(consequence_closed_update.clone()),
-            "listeners on Span `consequences` should have been updated",
+            updates.next(),
+            Some(crate::Update::OpenDirect {
+                cause: a_id_and_metadata,
+                consequence: b_id_and_metadata.clone(),
+            })
         );
-        assert_eq!(
-            root_updates.next(),
-            Some(consequence_closed_update),
-            "listeners on Span `root` should have been updated",
-        );
-
-        // and, with `consequences` gone, `root` is actually closed, too
-        assert_eq!(
-            root_updates.next(),
-            Some(crate::Update::CloseDirect {
-                id: root_id,
-                direct_cause: None,
-            }),
-            "listeners on Span `root` should have been updated",
-        );
-
-        assert!(root_updates.is_empty());
-        assert!(consequence_updates.is_empty());
-    }
-
-    /// Tests the causality layer on a trace involving a root with a single
-    /// indirect consequence.
-    #[test]
-    fn indirect_consequence() {
-        let subscriber: Arc<dyn Subscriber + Send + Sync> =
-            Arc::new(Registry::default().with(crate::Layer));
-        let _guard = subscriber.clone().set_default();
-        let subscriber: Arc<dyn Subscriber> = subscriber;
-        let subscriber = subscriber.downcast_ref::<Registry>().unwrap();
-
-        let cause = trace_span!("cause");
-        let cause_id = cause.id().unwrap();
-        let cause_updates = test_util::updates_for(subscriber, &cause);
-
-        let consequence = trace_span!("consequence");
-        let consequence_id = consequence.id().unwrap();
-        let consequence_updates = test_util::updates_for(subscriber, &consequence);
-
-        assert!(cause_updates.is_empty());
-        assert!(consequence_updates.is_empty());
-
-        consequence.follows_from(&cause_id);
-
-        assert!(test_util::consequences_of(subscriber, &cause).contains_indirect(&consequence_id));
-
-        assert!(consequence_updates.is_empty());
-        assert_eq!(
-            cause_updates.next(),
-            Some(crate::Update::NewIndirect {
-                cause: cause_id.clone(),
-                consequence: consequence_id.clone(),
-            }),
-            "listeners should have been updated that `consequence` indirectly follows from `cause`",
-        );
-        assert!(cause_updates.is_empty());
-
-        drop(consequence);
 
         assert_eq!(
-            cause_updates.next(),
-            Some(crate::Update::CloseIndirect {
-                id: consequence_id.clone(),
-                //direct_cause: None,
-                indirect_causes: vec![cause_id],
-            }),
-            "listeners on `a` should have been notified that that `b` was dropped",
+            updates.next(),
+            Some(crate::Update::OpenDirect {
+                cause: b_id_and_metadata,
+                consequence: c_id_and_metadata,
+            })
         );
     }
 }
