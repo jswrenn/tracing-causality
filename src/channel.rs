@@ -1,6 +1,7 @@
 use crate::Update;
 use std::{
     collections::BTreeSet,
+    fmt::Debug,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,

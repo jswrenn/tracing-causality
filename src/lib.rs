@@ -1,6 +1,6 @@
-use std::hash::{Hash, Hasher};
 use std::collections::HashMap;
-use tracing_core::Metadata;
+use std::fmt::Debug;
+use std::hash::{Hash, Hasher};
 use tracing_core::span::{Attributes, Id};
 use tracing_core::subscriber::Subscriber;
 use tracing_subscriber::layer::Context;
@@ -16,53 +16,76 @@ pub mod data;
 pub use data::Consequences;
 use data::Listeners;
 
+pub(crate) type Metadata = &'static tracing_core::Metadata<'static>;
+
 /// A causality graph, rooted at a given [`Id`].
 #[derive(Debug, Clone)]
-pub struct Trace {
-    pub root: Span,
-    pub adj: HashMap<Span, Consequences>,
+pub struct Trace<M = crate::Metadata>
+where
+    M: Clone + Debug,
+{
+    pub root: Span<M>,
+    pub adj: HashMap<Span<M>, Consequences<M>>,
 }
 
 #[derive(Debug, Clone)]
-pub struct Span {
+pub struct Span<M = crate::Metadata>
+where
+    M: Clone + Debug,
+{
     pub id: Id,
-    pub metadata: &'static Metadata<'static>,
+    pub metadata: M,
 }
 
-impl Hash for Span {
+impl<M> Hash for Span<M>
+where
+    M: Clone + Debug,
+{
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.id.hash(state);
-        self.metadata.callsite().hash(state);
     }
 }
 
-impl Eq for Span {}
+impl<M> Eq for Span<M> where M: Clone + Debug {}
 
-impl PartialEq for Span {
-    fn eq(&self, other: &Self) -> bool {
-        &self.id == &other.id 
-            && self.metadata.callsite() == other.metadata.callsite()
+impl<M, N> PartialEq<Span<N>> for Span<M>
+where
+    M: Clone + Debug,
+    N: Clone + Debug,
+{
+    fn eq(&self, other: &Span<N>) -> bool {
+        &self.id == &other.id
     }
 }
 
-impl Trace {
+impl<M> Trace<M>
+where
+    M: Clone + Debug,
+{
+    pub fn with_root(root: Span<M>) -> Self {
+        Self {
+            root,
+            adj: Default::default(),
+        }
+    }
+
     /// The `Id` of the root span of this trace.
-    pub fn root(&self) -> Span {
+    pub fn root(&self) -> Span<M> {
         self.root.to_owned()
     }
 
     /// The consequences of the `root` span of this trace.
-    pub fn root_consequences(&self) -> &Consequences {
+    pub fn root_consequences(&self) -> &Consequences<M> {
         self.adj.get(&self.root).unwrap()
     }
 
     /// The consequences of the given `id`.
-    pub fn consequences(&self, span: &Span) -> Option<&Consequences> {
+    pub fn consequences(&self, span: &Span<M>) -> Option<&Consequences<M>> {
         self.adj.get(span)
     }
 
     /// Update [`Trace`] with the given [`Update`].
-    pub fn apply(mut self, update: Update) -> Option<Trace> {
+    pub fn apply(mut self, update: Update<M>) -> Option<Trace<M>> {
         match update {
             Update::OpenDirect { cause, consequence } => {
                 self.adj
@@ -129,7 +152,7 @@ impl Trace {
     }
 
     /// A breadth-first traversal of [`Trace`].
-    pub fn iter(&self) -> impl Iterator<Item = (Span, &Consequences)> {
+    pub fn iter(&self) -> impl Iterator<Item = (Span<M>, &Consequences<M>)> {
         let mut queue = vec![(self.root.clone())];
         std::iter::from_fn(move || {
             let span = queue.pop()?;
@@ -137,15 +160,6 @@ impl Trace {
             queue.extend(consequences.iter_direct());
             Some((span, consequences))
         })
-    }
-}
-
-impl Trace {
-    pub fn with_root(root: Span) -> Self {
-        Self {
-            root,
-            adj: Default::default(),
-        }
     }
 }
 
@@ -313,7 +327,10 @@ where
 
 /// An update that should be applied to a [`Trace`].
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Update {
+pub enum Update<M = crate::Metadata>
+where
+    M: Clone + Debug,
+{
     /// Announces that `consequence` **directly** follows from `cause`.
     ///
     /// # Example
@@ -355,7 +372,10 @@ pub enum Update {
     ///     );
     /// }
     /// ```
-    OpenDirect { cause: Span, consequence: Span },
+    OpenDirect {
+        cause: Span<M>,
+        consequence: Span<M>,
+    },
 
     /// Announces that `consequence` **indirectly** follows from `cause`.
     ///
@@ -400,7 +420,10 @@ pub enum Update {
     ///     );
     /// }
     /// ```
-    NewIndirect { cause: Span, consequence: Span },
+    NewIndirect {
+        cause: Span<M>,
+        consequence: Span<M>,
+    },
 
     /// Announces that a direct consequence of a `Span` within [`Trace`] was
     /// closed, and is thus no longer an extant consequence of `direct_cause`.
@@ -446,7 +469,10 @@ pub enum Update {
     ///     );
     /// }
     /// ```
-    CloseDirect { span: Span, direct_cause: Option<Span> },
+    CloseDirect {
+        span: Span<M>,
+        direct_cause: Option<Span<M>>,
+    },
 
     /// Announces that an indirect consequence of a `Span` within [`Trace`] was
     /// closed, and is thus no longer an extant consequence of `indirect_causes`.
@@ -494,7 +520,10 @@ pub enum Update {
     ///     );
     /// }
     /// ```
-    CloseIndirect { span: Span, indirect_causes: Vec<Span> },
+    CloseIndirect {
+        span: Span<M>,
+        indirect_causes: Vec<Span<M>>,
+    },
 
     /// Announces that a self-cycling consequence of a `Span` within [`Trace`]
     /// was closed, and is thus no longer an extant consequence of
@@ -545,9 +574,9 @@ pub enum Update {
     /// }
     /// ```
     CloseCyclic {
-        span: Span,
-        direct_cause: Option<Span>,
-        indirect_causes: Vec<Span>,
+        span: Span<M>,
+        direct_cause: Option<Span<M>>,
+        indirect_causes: Vec<Span<M>>,
     },
 }
 
@@ -646,7 +675,12 @@ where
         }
     }
 
-    fn on_follows_from(&self, consequence_id_and_metadata: &Id, cause_id_and_metadata: &Id, ctx: Context<'_, S>) {
+    fn on_follows_from(
+        &self,
+        consequence_id_and_metadata: &Id,
+        cause_id_and_metadata: &Id,
+        ctx: Context<'_, S>,
+    ) {
         use data::IndirectCauses;
 
         if cause_id_and_metadata == consequence_id_and_metadata {
@@ -684,9 +718,13 @@ where
 
         // 1. insert `consequence` as an indirect consequence of `cause`
         if let Some(consequences) = cause_data.get_mut::<Consequences>() {
-            consequences.indirect.insert(consequence_id_and_metadata.clone());
+            consequences
+                .indirect
+                .insert(consequence_id_and_metadata.clone());
         } else {
-            cause_data.insert(Consequences::with_indirect(consequence_id_and_metadata.clone()));
+            cause_data.insert(Consequences::with_indirect(
+                consequence_id_and_metadata.clone(),
+            ));
         }
 
         // 2. insert `cause` as an indirect cause of `consequence`
@@ -775,13 +813,19 @@ where
             let update = if let Some(indirect_causes) = is_cyclic {
                 Update::CloseCyclic {
                     span: closed_id_and_metadata,
-                    direct_cause: direct_cause.map(|c| Span { id: c.id(), metadata: c.metadata() }),
+                    direct_cause: direct_cause.map(|c| Span {
+                        id: c.id(),
+                        metadata: c.metadata(),
+                    }),
                     indirect_causes,
                 }
             } else {
                 Update::CloseDirect {
                     span: closed_id_and_metadata,
-                    direct_cause: direct_cause.map(|c| Span { id: c.id(), metadata: c.metadata() }),
+                    direct_cause: direct_cause.map(|c| Span {
+                        id: c.id(),
+                        metadata: c.metadata(),
+                    }),
                 }
             };
             channel::Sender::broadcast(listeners, update);
@@ -893,7 +937,8 @@ mod test {
                 .get::<crate::Listeners>()
                 .is_none());
 
-            let (_trace, _updates) = causality::trace(registry, &a_id_and_metadata.id, 1024).unwrap();
+            let (_trace, _updates) =
+                causality::trace(registry, &a_id_and_metadata.id, 1024).unwrap();
 
             // after `trace`, there should be 1 listener on `a`
             assert_eq!(
@@ -942,7 +987,8 @@ mod test {
                 .get::<crate::Listeners>()
                 .is_none());
 
-            let (_trace, _updates) = causality::trace(registry, &a_id_and_metadata.id, 1024).unwrap();
+            let (_trace, _updates) =
+                causality::trace(registry, &a_id_and_metadata.id, 1024).unwrap();
 
             // after `trace`, there should be 1 listener on `a`
             assert_eq!(
@@ -1004,7 +1050,8 @@ mod test {
                 .is_none());
 
             // trace `b`
-            let (_trace, _updates) = causality::trace(registry, &b_id_and_metadata.id, 1024).unwrap();
+            let (_trace, _updates) =
+                causality::trace(registry, &b_id_and_metadata.id, 1024).unwrap();
 
             // after `trace`, there should be 0 listeners on `a`
             assert!(registry
@@ -1027,7 +1074,8 @@ mod test {
             );
 
             // trace `a`
-            let (_trace, _updates) = causality::trace(registry, &a_id_and_metadata.id, 1024).unwrap();
+            let (_trace, _updates) =
+                causality::trace(registry, &a_id_and_metadata.id, 1024).unwrap();
 
             // after `trace`, there should be 1 listener on `a`
             assert_eq!(
@@ -1083,7 +1131,8 @@ mod test {
                     .get::<crate::Listeners>()
                     .is_none());
 
-                let (_trace, updates) = causality::trace(registry, &a_id_and_metadata.id, 1024).unwrap();
+                let (_trace, updates) =
+                    causality::trace(registry, &a_id_and_metadata.id, 1024).unwrap();
 
                 // after `trace`, there should be 1 listener on `a`
                 assert_eq!(
@@ -1130,7 +1179,8 @@ mod test {
                     metadata: a.metadata().unwrap(),
                 };
 
-                let (_trace, _updates) = causality::trace(registry, &a_id_and_metadata.id, 1024).unwrap();
+                let (_trace, _updates) =
+                    causality::trace(registry, &a_id_and_metadata.id, 1024).unwrap();
 
                 let b = a.in_scope(|| tracing::trace_span!("b"));
                 let b_id_and_metadata = causality::Span {
@@ -1138,7 +1188,8 @@ mod test {
                     metadata: b.metadata().unwrap(),
                 };
 
-                let (_trace, _updates) = causality::trace(registry, &b_id_and_metadata.id, 1024).unwrap();
+                let (_trace, _updates) =
+                    causality::trace(registry, &b_id_and_metadata.id, 1024).unwrap();
 
                 let a_listeners = registry
                     .span_data(&a_id_and_metadata.id)
@@ -1329,7 +1380,8 @@ mod test {
                     metadata: consequence.metadata().unwrap(),
                 };
 
-                let (_trace, cause_updates) = crate::trace(registry, &cause_id_and_metadata.id, 1024).unwrap();
+                let (_trace, cause_updates) =
+                    crate::trace(registry, &cause_id_and_metadata.id, 1024).unwrap();
                 let (_trace, consequence_updates) =
                     crate::trace(registry, &consequence_id_and_metadata.id, 1024).unwrap();
 
@@ -1374,7 +1426,7 @@ mod test {
                 let cause_id_and_metadata = causality::Span {
                     id: cause.id().unwrap(),
                     metadata: cause.metadata().unwrap(),
-                };;
+                };
 
                 let consequence = tracing::trace_span!("consequence");
                 let consequence_id_and_metadata = causality::Span {
@@ -1382,8 +1434,10 @@ mod test {
                     metadata: consequence.metadata().unwrap(),
                 };
 
-                let (_trace, _updates) = crate::trace(registry, &cause_id_and_metadata.id, 1024).unwrap();
-                let (_trace, _updates) = crate::trace(registry, &consequence_id_and_metadata.id, 1024).unwrap();
+                let (_trace, _updates) =
+                    crate::trace(registry, &cause_id_and_metadata.id, 1024).unwrap();
+                let (_trace, _updates) =
+                    crate::trace(registry, &consequence_id_and_metadata.id, 1024).unwrap();
 
                 assert_eq!(
                     causality::consequences(registry, &cause_id_and_metadata.id)
@@ -1436,7 +1490,8 @@ mod test {
 
                 consequence.follows_from(&cause_id_and_metadata.id);
 
-                let (_trace, cause_updates) = crate::trace(registry, &cause_id_and_metadata.id, 1024).unwrap();
+                let (_trace, cause_updates) =
+                    crate::trace(registry, &cause_id_and_metadata.id, 1024).unwrap();
                 let (_trace, _consequence_updates) =
                     crate::trace(registry, &consequence_id_and_metadata.id, 1024).unwrap();
 
@@ -1479,7 +1534,8 @@ mod test {
 
                 consequence.follows_from(&cause_id_and_metadata.id);
 
-                let (_trace, cause_updates) = crate::trace(registry, &cause_id_and_metadata.id, 1024).unwrap();
+                let (_trace, cause_updates) =
+                    crate::trace(registry, &cause_id_and_metadata.id, 1024).unwrap();
                 let (_trace, _consequence_updates) =
                     crate::trace(registry, &consequence_id_and_metadata.id, 1024).unwrap();
 
@@ -1531,7 +1587,10 @@ mod test2 {
         };
 
         let (trace, updates) = crate::trace(subscriber, &a_id_and_metadata.id, 1).unwrap();
-        assert!(trace.consequences(&a_id_and_metadata).unwrap().contains_direct(&b_id_and_metadata));
+        assert!(trace
+            .consequences(&a_id_and_metadata)
+            .unwrap()
+            .contains_direct(&b_id_and_metadata));
 
         let c = b.in_scope(|| tracing::trace_span!("c"));
         let c_id_and_metadata = causality::Span {
