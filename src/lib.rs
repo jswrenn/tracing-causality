@@ -24,10 +24,11 @@ pub struct Trace<M = crate::Metadata>
 where
     M: Clone + Debug,
 {
-    pub root: Span<M>,
-    pub adj: HashMap<Span<M>, Consequences<M>>,
+    root: Span<M>,
+    adj: HashMap<Span<M>, Consequences<M>>,
 }
 
+/// A `Span`, represented by its [`Id`] and metadata.
 #[derive(Debug, Clone)]
 pub struct Span<M = crate::Metadata>
 where
@@ -326,7 +327,7 @@ where
 }
 
 /// An update that should be applied to a [`Trace`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub enum Update<M = crate::Metadata>
 where
     M: Clone + Debug,
@@ -578,6 +579,76 @@ where
         direct_cause: Option<Span<M>>,
         indirect_causes: Vec<Span<M>>,
     },
+}
+
+impl<M> Eq for Update<M> where M: Clone + Debug + Eq {}
+
+impl<M> PartialEq<Update<M>> for Update<M>
+where
+    M: Clone + Debug + PartialEq,
+{
+    fn eq(&self, other: &Update<M>) -> bool {
+        use Update::*;
+        match (self, other) {
+            (
+                OpenDirect {
+                    cause: lhs_cause,
+                    consequence: lhs_consequence,
+                },
+                OpenDirect {
+                    cause: rhs_cause,
+                    consequence: rhs_consequence,
+                },
+            )
+            | (
+                NewIndirect {
+                    cause: lhs_cause,
+                    consequence: lhs_consequence,
+                },
+                NewIndirect {
+                    cause: rhs_cause,
+                    consequence: rhs_consequence,
+                },
+            ) => (lhs_cause == rhs_cause) && (lhs_consequence == rhs_consequence),
+            (
+                CloseDirect {
+                    span: lhs_span,
+                    direct_cause: lhs_direct_cause,
+                },
+                CloseDirect {
+                    span: rhs_span,
+                    direct_cause: rhs_direct_cause,
+                },
+            ) => (lhs_span == rhs_span) && (lhs_direct_cause == rhs_direct_cause),
+            (
+                CloseIndirect {
+                    span: lhs_span,
+                    indirect_causes: lhs_indirect_causes,
+                },
+                CloseIndirect {
+                    span: rhs_span,
+                    indirect_causes: rhs_indirect_causes,
+                },
+            ) => (lhs_span == rhs_span) && (lhs_indirect_causes == rhs_indirect_causes),
+            (
+                CloseCyclic {
+                    span: lhs_span,
+                    direct_cause: lhs_direct_cause,
+                    indirect_causes: lhs_indirect_causes,
+                },
+                CloseCyclic {
+                    span: rhs_span,
+                    direct_cause: rhs_direct_cause,
+                    indirect_causes: rhs_indirect_causes,
+                },
+            ) => {
+                (lhs_span == rhs_span)
+                    && (lhs_direct_cause == rhs_direct_cause)
+                    && (lhs_indirect_causes == rhs_indirect_causes)
+            }
+            _ => false,
+        }
+    }
 }
 
 /// A [tracing-subscriber layer] for monitoring the causal relationships between
