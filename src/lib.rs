@@ -905,83 +905,15 @@ where
 }
 
 #[cfg(test)]
-mod test_util {
-    use crate::{channel, Consequences};
-    use tracing::{Id, Span};
-    use tracing_subscriber::registry::LookupSpan;
-    use tracing_subscriber::registry::SpanData;
-
-    pub(crate) fn updates_for<S>(s: &S, span: &Span) -> channel::Updates
-    where
-        S: for<'span> LookupSpan<'span> + ?Sized,
-    {
-        use crate::data::Listeners;
-        let id = span.id().expect(&format!("span {:?} is not enabled", span));
-        let data = s
-            .span_data(&id)
-            .expect(&format!("span {:?} is not open", &id));
-        let mut extensions = data.extensions_mut();
-        let (sender, updates) = channel::bounded(id, 100);
-        crate::get_or_init_with::<Listeners, _>(&mut extensions, Listeners::new).insert(sender);
-        updates
-    }
-
-    pub(crate) fn direct_cause_of<S>(s: &S, span: &Span) -> Option<Id>
-    where
-        S: for<'span> LookupSpan<'span> + ?Sized,
-    {
-        let id = span.id().expect(&format!("span {:?} is not enabled", span));
-        s.span_data(&id)
-            .expect(&format!("span {:?} is not open", id))
-            .parent()
-            .cloned()
-    }
-
-    pub(crate) fn assert_lacks_consequences<S>(s: &S, span: &Span)
-    where
-        S: for<'span> LookupSpan<'span> + ?Sized,
-    {
-        let id = span.id().expect(&format!("span {:?} is not enabled", span));
-        assert_eq!(
-            None,
-            s.span_data(&id)
-                .expect(&format!("span {:?} is not open", &id))
-                .extensions()
-                .get::<Consequences>(),
-            "span {:?} should lack {:?}",
-            span,
-            std::any::type_name::<Consequences>(),
-        );
-    }
-
-    pub(crate) fn consequences_of<S>(s: &S, span: &Span) -> Consequences
-    where
-        S: for<'span> LookupSpan<'span> + ?Sized,
-    {
-        let id = span.id().expect(&format!("span {:?} is not enabled", span));
-        s.span_data(&id)
-            .expect(&format!("span {:?} is not open", &id))
-            .extensions()
-            .get::<Consequences>()
-            .expect(&format!(
-                "span {:?} lacks {:?}",
-                id,
-                std::any::type_name::<Consequences>()
-            ))
-            .clone()
-    }
-}
-
-#[cfg(test)]
 mod test {
-    use crate::{self as causality, Consequences, Update, Updates};
+    use crate::{self as causality, Consequences, Update};
     use std::sync::Arc;
     use tracing_core::Subscriber;
     use tracing_subscriber::registry::{LookupSpan, SpanData};
     use tracing_subscriber::{prelude::*, registry::Registry};
 
     mod trace {
-        use crate::{self as causality, Consequences, Update, Updates};
+        use crate::{self as causality};
         use std::sync::Arc;
         use tracing_core::Subscriber;
         use tracing_subscriber::registry::{LookupSpan, SpanData};
@@ -1631,7 +1563,7 @@ mod test {
 
 #[cfg(test)]
 mod test2 {
-    use crate::{self as causality, Consequences, Update, Updates};
+    use crate::{self as causality};
     use std::sync::Arc;
     use tracing_core::Subscriber;
     use tracing_subscriber::registry::{LookupSpan, SpanData};

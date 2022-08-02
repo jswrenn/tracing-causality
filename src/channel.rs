@@ -100,6 +100,18 @@ impl Updates {
     }
 }
 
+impl Default for Updates {
+    fn default() -> Self {
+        let (_, receiver) = flume::bounded(0);
+        let overflow_flag = OverflowFlag::default();
+
+        Self {
+            receiver,
+            overflow_flag,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Sender {
     id: Id,
